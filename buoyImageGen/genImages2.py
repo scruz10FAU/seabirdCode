@@ -7,6 +7,8 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
+import signal
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 # -----------------------------
 # CONFIG
@@ -16,7 +18,7 @@ RED_IMG   = "./images/LightBeacon_Red_Above_Pool.JPG"
 
 #OUT_DIR = Path(r"C:\Users\Precision 3571\OneDrive\Desktop\buoyImageGen\synthetic_buoy_dataset_v2")
 OUT_DIR = Path("./synthetic_buoy_dataset_vs")
-N_IMAGES = 5000
+N_IMAGES = 10
 OUT_W, OUT_H = 1280, 720
 
 # Labels
@@ -41,7 +43,8 @@ ENABLE_RIPPLE = True
 ENABLE_MOTION_BLUR = True
 
 # Performance
-NUM_WORKERS = max(1, min(cpu_count() - 1, 8))
+#NUM_WORKERS = max(1, min(cpu_count() - 1, 8))
+NUM_WORKERS = 1
 
 # Reproducibility
 BASE_SEED = 7
@@ -287,14 +290,143 @@ def make_cutout_rgba(img_bgr, rect):
     rgba[..., 3] = fg
     return rgba
 
+def make_cutout_rgba_color_seed(img_bgr, buoy_color: str):
+    """
+    buoy_color: "green" or "red"
+    Uses HSV thresholds to seed sure-foreground from the illuminated lens,
+    then runs GrabCut with a mask init so it doesn't grab the deck.
+    """
+    img = img_bgr.copy()
+    h, w = img.shape[:2]
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    if buoy_color == "green":
+        # green lens range (tune if needed)
+        lower = np.array([35, 80, 80])
+        upper = np.array([95, 255, 255])
+        seed = cv2.inRange(hsv, lower, upper)
+    else:
+        # red lens wraps HSV hue, so use two ranges
+        lower1 = np.array([0, 90, 70])
+        upper1 = np.array([12, 255, 255])
+        lower2 = np.array([165, 90, 70])
+        upper2 = np.array([179, 255, 255])
+        seed = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+
+    # Keep only the biggest connected component (the lens)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((seed > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        # fallback: rectangle-based grabcut if seeding fails
+        rect = auto_rect_for_buoy(img)
+        return make_cutout_rgba(img, rect)
+
+    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    seed = (labels == largest).astype(np.uint8) * 255
+
+    # Grow seed so it covers lens + some buoy body
+    seed_fg = cv2.dilate(seed, np.ones((25, 25), np.uint8), iterations=1)
+    seed_fg = cv2.GaussianBlur(seed_fg, (0, 0), 7)
+
+    # Initialize GrabCut mask:
+    # GC_BGD=0, GC_FGD=1, GC_PR_BGD=2, GC_PR_FGD=3
+    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+
+    # sure foreground where seed is strong
+    gc_mask[seed_fg > 40] = cv2.GC_PR_FGD
+    gc_mask[seed > 0] = cv2.GC_FGD
+
+    # sure background: image borders are almost never buoy
+    border = 15
+    gc_mask[:border, :] = cv2.GC_BGD
+    gc_mask[-border:, :] = cv2.GC_BGD
+    gc_mask[:, :border] = cv2.GC_BGD
+    gc_mask[:, -border:] = cv2.GC_BGD
+
+    bgModel = np.zeros((1, 65), np.float64)
+    fgModel = np.zeros((1, 65), np.float64)
+
+    cv2.grabCut(img, gc_mask, None, bgModel, fgModel, 7, cv2.GC_INIT_WITH_MASK)
+
+    alpha = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+    # Cleanup: remove small junk and smooth edges
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, np.ones((5,5), np.uint8), iterations=1)
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8), iterations=2)
+
+    rgba = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    rgba[..., 3] = alpha
+    return rgba
+
+def add_buoy_reflection(bg_bgr, buoy_rgba, bbox, strength=0.35):
+    """
+    Creates a reflection from the buoy itself:
+    - flip vertically
+    - squash vertically
+    - ripple distort
+    - fade out with a vertical gradient
+    - blur slightly
+    """
+    x0, y0, x1, y1 = bbox
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+
+    # Extract the buoy region from the composed image by using bbox-sized reflection of buoy_rgba
+    # Better: build reflection from buoy_rgba itself by cropping its non-transparent bbox.
+    a = buoy_rgba[..., 3]
+    ys, xs = np.where(a > 10)
+    if len(xs) == 0:
+        return bg_bgr
+
+    bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max(), ys.max()
+    buoy_crop = buoy_rgba[by0:by1+1, bx0:bx1+1].copy()
+
+    # Flip vertically to reflect
+    refl = cv2.flip(buoy_crop, 0)
+
+    # Squash reflection (water reflections are vertically compressed)
+    squash = random.uniform(0.35, 0.65)
+    refl = cv2.resize(refl, (refl.shape[1], max(1, int(refl.shape[0] * squash))), interpolation=cv2.INTER_LINEAR)
+
+    # Apply ripple to reflection only
+    if random.random() < 0.9:
+        rh, rw = refl.shape[:2]
+        yy, xx = np.mgrid[0:rh, 0:rw].astype(np.float32)
+        phase = random.uniform(0, 2*np.pi)
+        amp = random.uniform(1.0, 4.0)
+        wl  = random.uniform(25.0, 60.0)
+        dx = amp * np.sin(2*np.pi * yy / wl + phase)
+        map_x = np.clip(xx + dx, 0, rw-1).astype(np.float32)
+        map_y = yy.astype(np.float32)
+        refl = cv2.remap(refl, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    # Fade out with distance (alpha gradient)
+    rh, rw = refl.shape[:2]
+    grad = np.linspace(1.0, 0.0, rh).astype(np.float32)[:, None]
+    refl[..., 3] = np.clip(refl[..., 3].astype(np.float32) * grad * (255.0 * strength / 255.0), 0, 255).astype(np.uint8)
+
+    # Blur reflection
+    refl_bgr = refl[..., :3]
+    refl_a   = refl[..., 3]
+    refl_bgr = cv2.GaussianBlur(refl_bgr, (0,0), sigmaX=random.uniform(1.5, 3.5))
+    refl = cv2.cvtColor(refl_bgr, cv2.COLOR_BGR2BGRA)
+    refl[..., 3] = refl_a
+
+    # Place reflection directly below buoy bbox
+    # Reflection "starts" near bottom of buoy bbox
+    place_x = x0 + int(0.05 * w)
+    place_y = y1 - int(0.05 * h)
+
+    comp, _, _ = alpha_paste(bg_bgr, refl, place_x, place_y)
+    return comp
 
 # -----------------------------
 # Background crops
 # -----------------------------
 def random_water_crop(img_bgr, out_w, out_h):
     h, w = img_bgr.shape[:2]
-    y_min = int(h * 0.45)
-    y_max = int(h * 0.92)
+    y_min = int(h * 0.60)
+    y_max = int(h * 0.95)
 
     crop_w = random.randint(int(w * 0.45), int(w * 0.98))
     crop_h = random.randint(int(h * 0.30), int(h * 0.60))
@@ -326,12 +458,16 @@ def init_worker(seed, green_path, red_path):
 
     g = cv2.imread(green_path, cv2.IMREAD_COLOR)
     r = cv2.imread(red_path,   cv2.IMREAD_COLOR)
-    if g is None or r is None:
-        raise FileNotFoundError("Could not load input images. Check GREEN_IMG / RED_IMG paths.")
+    if g is None:
+        raise FileNotFoundError(f"Could not load GREEN_IMG at: {green_path}")
+    if r is None:
+        raise FileNotFoundError(f"Could not load RED_IMG at: {red_path}")
 
-    g_rgba = make_cutout_rgba(g, auto_rect_for_buoy(g))
-    r_rgba = make_cutout_rgba(r, auto_rect_for_buoy(r))
-    ASSETS = Assets(g, r, g_rgba, r_rgba)
+    # Use the images you just loaded (g and r)
+    green_rgba = make_cutout_rgba_color_seed(g, "green")
+    red_rgba   = make_cutout_rgba_color_seed(r, "red")
+
+    ASSETS = Assets(green_bgr=g, red_bgr=r, green_rgba=green_rgba, red_rgba=red_rgba)
 
 def generate_one(i):
     # Balanced sampling: alternate green/red
@@ -382,6 +518,9 @@ def generate_one(i):
     y = clamp_randint(ymin, ymax)
 
     comp, bbox, cut_frac = alpha_paste(bg, buoy_warp, x, y)
+
+    if bbox is not None:
+        comp = add_buoy_reflection(comp, buoy_warp, bbox, strength=random.uniform(0.20, 0.45))
     if bbox is None:
         return None  # reject
 
@@ -463,7 +602,7 @@ def main():
               initargs=(BASE_SEED, GREEN_IMG, RED_IMG)) as pool:
 
         # We generate in chunks; rejected ones return None; we keep going until produced == target.
-        chunk = 500
+        chunk = max(1, target//5)
         while produced < target:
             # schedule indices for this chunk
             idxs = list(range(attempted, attempted + chunk))
@@ -498,4 +637,7 @@ def main():
     print(f"\nDone.\n  Output: {OUT_DIR}\n  Images: {img_dir}\n  Labels: {lbl_dir}\n  Meta:   {meta_path}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCTRL+C detected — stopping workers...")
