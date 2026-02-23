@@ -603,36 +603,58 @@ def main():
 
         # We generate in chunks; rejected ones return None; we keep going until produced == target.
         chunk = max(1, target//5)
-        while produced < target:
-            # schedule indices for this chunk
-            idxs = list(range(attempted, attempted + chunk))
-            attempted += chunk
+        max_attempts = max(200, target * 200)   # safety: 200 tries per image
+        attempted = 0
+        produced = 0
 
-            for result in pool.imap_unordered(generate_one, idxs):
-                if result is None:
-                    continue
+        pool = Pool(processes=NUM_WORKERS,
+                    initializer=init_worker,
+                    initargs=(BASE_SEED, GREEN_IMG, RED_IMG))
 
-                stem = result["stem"]
-                img  = result["image"]
-                bbox = result["bbox"]
-                cls  = result["class_id"]
+        try:
+            chunk = max(1, min(200, target * 20))  # small target -> small chunks
+            while produced < target and attempted < max_attempts:
+                idxs = list(range(attempted, attempted + chunk))
+                attempted += chunk
 
-                out_img = img_dir / f"{stem}.jpg"
-                out_lbl = lbl_dir / f"{stem}.txt"
+                got_any = False
+                for result in pool.imap_unordered(generate_one, idxs):
+                    if result is None:
+                        continue
 
-                cv2.imwrite(str(out_img), img)
-                with open(out_lbl, "w", encoding="utf-8") as f:
-                    f.write(yolo_line_from_bbox(bbox, OUT_W, OUT_H, cls=cls))
+                    got_any = True
+                    stem = result["stem"]
+                    img  = result["image"]
+                    bbox = result["bbox"]
+                    cls  = result["class_id"]
 
-                with open(meta_path, "a", encoding="utf-8") as mf:
-                    mf.write(json.dumps(result["meta"]) + "\n")
+                    out_img = img_dir / f"{stem}.jpg"
+                    out_lbl = lbl_dir / f"{stem}.txt"
 
-                produced += 1
-                if produced % 250 == 0:
-                    print(f"Produced {produced}/{target} (attempted {attempted})")
+                    cv2.imwrite(str(out_img), img)
+                    with open(out_lbl, "w", encoding="utf-8") as f:
+                        f.write(yolo_line_from_bbox(bbox, OUT_W, OUT_H, cls=cls))
 
-                if produced >= target:
-                    break
+                    with open(meta_path, "a", encoding="utf-8") as mf:
+                        mf.write(json.dumps(result["meta"]) + "\n")
+
+                    produced += 1
+                    print(f"Produced {produced}/{target} (attempted {attempted})", flush=True)
+
+                    if produced >= target:
+                        break
+
+                if not got_any:
+                    print(f"No accepted samples in last chunk. attempted={attempted}, produced={produced}", flush=True)
+
+            if produced < target:
+                print(f"\nStopped early: produced {produced}/{target} after {attempted} attempts.", flush=True)
+
+        except KeyboardInterrupt:
+            print("\nCTRL+C pressed — terminating pool...", flush=True)
+        finally:
+            pool.terminate()
+            pool.join()
 
     print(f"\nDone.\n  Output: {OUT_DIR}\n  Images: {img_dir}\n  Labels: {lbl_dir}\n  Meta:   {meta_path}")
 
