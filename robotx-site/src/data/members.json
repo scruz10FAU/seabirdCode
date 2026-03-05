@@ -2,11 +2,15 @@
   {
     "name": "Samantha Garcia",
     "role": "UAV Team Lead",
-    "bio": ""
+    "bio": "",
+    "photo": "members/samantha-garcia.jpeg",
+    "linkedin": "https://www.linkedin.com/in/samantha-garcia-597202181"
   },
   {
     "name": "Xavier Vicent Navarro",
     "role": "USV/UUV Team Lead",
-    "bio": ""
+    "bio": "",
+    "photo": "",
+    "linkedin": ""
   }
 ]

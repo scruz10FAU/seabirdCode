@@ -161,13 +161,45 @@ function TeamEditor() {
       {team.map((m, idx) => (
         <Card key={idx} className="rounded-2xl">
           <CardHeader>
-            <CardTitle>
-              <div className="truncate">{m.name}</div>
-              <div className="text-sm text-muted-foreground font-normal mt-1">{m.role || "—"}</div>
-            </CardTitle>
+            <div className="flex items-start gap-4">
+
+              {/* Profile photo */}
+              <div className="h-14 w-14 rounded-2xl overflow-hidden bg-black/5 dark:bg-white/10 shrink-0">
+                {m.photo ? (
+                  <img src={m.photo} alt={m.name} className="h-full w-full object-cover" />
+                ) : (
+                  <div className="h-full w-full flex items-center justify-center text-xs text-muted-foreground">
+                    Photo
+                  </div>
+                )}
+              </div>
+
+              {/* Name and role */}
+              <div className="min-w-0 flex-1">
+                <CardTitle>
+                  <div className="truncate">{m.name}</div>
+                  <div className="text-sm text-muted-foreground font-normal mt-1">
+                    {m.role || "—"}
+                  </div>
+                </CardTitle>
+              </div>
+
+              {/* LinkedIn button */}
+              {m.linkedin && (
+                <Button asChild variant="secondary" className="rounded-2xl">
+                  <a href={m.linkedin} target="_blank" rel="noreferrer">
+                    LinkedIn
+                  </a>
+                </Button>
+              )}
+
+            </div>
           </CardHeader>
+
           <CardContent>
-            <p className="text-sm text-muted-foreground leading-relaxed">{m.bio || ""}</p>
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              {m.bio || ""}
+            </p>
           </CardContent>
         </Card>
       ))}
