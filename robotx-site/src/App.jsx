@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import materials from "@/data/materials.json";
 import {
   Heart,
   Handshake,
@@ -121,14 +122,7 @@ function AffiliateLogos() {
 }
 
 function MaterialsEditor() {
-  const items = [
-    { name: "Tickets to Singapore", qty: "Assorted", priority: "High" },
-    { name: "Marine-grade hardware (stainless fasteners)", qty: "Assorted", priority: "High" },
-    { name: "Batteries / power distribution components", qty: "TBD", priority: "High" },
-    { name: "Sensors (GPS, IMU, cameras)", qty: "TBD", priority: "Medium" },
-    { name: "Comms (telemetry radios, antennas)", qty: "TBD", priority: "Medium" },
-    { name: "Safety equipment (kill switch, floatation)", qty: "TBD", priority: "High" },
-  ];
+  const items = materials;
 
   const priorityPill = (p) => {
     const cls =
