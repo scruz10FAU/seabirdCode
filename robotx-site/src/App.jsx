@@ -29,7 +29,7 @@ import {
  * - This is front-end only; forms are demo-only (no backend).
  */
 
-const GOFUNDME_URL = "https://www.gofundme.com/"; // TODO: replace with your campaign
+const GOFUNDME_URL = "https://gofund.me/316a2c928"; // TODO: replace with your campaign
 
 const NAV = [
   { id: "home", label: "RobotX" },
@@ -135,17 +135,12 @@ function TeamEditor() {
     {
       name: "Samantha Garcia",
       role: "UAV Team Lead",
-      bio: "Write a short bio here. Mention responsibilities, major projects, and what you’re excited about this season.",
+      bio: "",
     },
     {
       name: "Xavier Vicent Navarro",
       role: "USV/UUV Team Lead",
-      bio: "Short bio. Add skills, experience, and what they contribute.",
-    },
-    {
-      name: "Teammate Name",
-      role: "Mechanical / Fabrication",
-      bio: "Short bio. Mention tools, CAD/CAM, and prototyping work.",
+      bio: "",
     },
   ];
 
@@ -180,65 +175,6 @@ function ContactForm() {
   };
 
   return (
-    <div className="grid gap-6 lg:grid-cols-3">
-      <Card className="rounded-2xl lg:col-span-2">
-        <CardHeader>
-          <CardTitle>Send us a message</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={submit} className="space-y-4">
-            <div className="grid md:grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <div className="text-sm text-muted-foreground">Name</div>
-                <Input
-                  className="rounded-2xl"
-                  value={form.name}
-                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                  placeholder="Your name"
-                />
-              </div>
-              <div className="space-y-2">
-                <div className="text-sm text-muted-foreground">Email</div>
-                <Input
-                  className="rounded-2xl"
-                  value={form.email}
-                  onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-                  placeholder="you@example.com"
-                  type="email"
-                />
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="text-sm text-muted-foreground">Message</div>
-              <Textarea
-                className="rounded-2xl min-h-[140px]"
-                value={form.message}
-                onChange={(e) => setForm((f) => ({ ...f, message: e.target.value }))}
-                placeholder="How can we help?"
-              />
-            </div>
-            <div className="flex items-center gap-3">
-              <Button className="rounded-2xl" type="submit">Send</Button>
-              <AnimatePresence>
-                {sent && (
-                  <motion.div
-                    initial={{ opacity: 0, y: 6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 6 }}
-                    className="text-sm text-muted-foreground"
-                  >
-                    Message queued (demo).
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              This is a front-end demo. Hook this up to Formspree, Netlify Forms, or an email API to receive messages.
-            </div>
-          </form>
-        </CardContent>
-      </Card>
-
       <Card className="rounded-2xl">
         <CardHeader>
           <CardTitle>Contact details</CardTitle>
@@ -250,14 +186,7 @@ function ContactForm() {
           </div>
           <div>
             <div className="text-muted-foreground">Sponsorship</div>
-            <div className="font-medium">sponsors@example.com</div>
-          </div>
-          <div>
-            <div className="text-muted-foreground">Location</div>
-            <div className="font-medium">Boca Raton, Florida</div>
-          </div>
-          <div className="text-xs text-muted-foreground">
-            Replace these placeholders with real addresses and inboxes.
+            <div className="font-medium">scruz10@fau.edu</div>
           </div>
         </CardContent>
       </Card>

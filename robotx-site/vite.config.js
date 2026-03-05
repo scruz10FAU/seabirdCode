@@ -14,6 +14,9 @@ import path from "path";
 
 export default defineConfig({
   plugins: [react()],
+  server: {
+		allowedHosts: ['seabird.targadev.com']
+},
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
