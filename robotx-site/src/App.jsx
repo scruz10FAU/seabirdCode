@@ -190,7 +190,6 @@ function ContactForm() {
           </div>
         </CardContent>
       </Card>
-    </div>
   );
 }
 
