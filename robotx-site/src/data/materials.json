@@ -4,6 +4,31 @@
     "priority": "High" 
   },
   {
+    "name": "Jetson Computers",
+    "qty": "Assorted",
+    "priority": "High"
+  },
+  {
+    "name": "Cameras",
+    "qty": "Assorted",
+    "priority": "High"
+  },
+  {
+    "name": "Acoustic Modems",
+    "qty": "Assorted",
+    "priority": "High"
+  },
+  {
+    "name": "Hydrophones",
+    "qty": "Assorted",
+    "priority": "High"
+  },
+  {
+    "name": "Ubuntu Laptops for AI training",
+    "qty": "Assorted",
+    "priority": "High"
+  },
+  {
     "name": "Marine-grade hardware (stainless fasteners)",
     "qty": "Assorted",
     "priority": "High"
