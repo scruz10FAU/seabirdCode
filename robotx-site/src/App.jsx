@@ -34,6 +34,7 @@ const GOFUNDME_URL = "https://gofund.me/316a2c928"; // TODO: replace with your c
 const NAV = [
   { id: "home", label: "RobotX" },
   { id: "sponsor", label: "Become a Sponsor" },
+  { id: "logos", label: "Affiliations" },
   { id: "materials", label: "Needed Materials" },
   { id: "about", label: "About Us" },
   { id: "contact", label: "Contact" },
@@ -89,6 +90,33 @@ function SponsorTier({ name, amount, perks }) {
         </ul>
       </CardContent>
     </Card>
+  );
+}
+
+function AffiliateLogos() {
+  const logos = [
+    { name: "Center for Connected Autonomy and Artificial Intelligence", src: "/logos/CAAIlogo.png", url: "https://www.fau.edu/engineering/research/c2a2/" },
+    { name: "Marine Robotics Club - Team Owltonomous", src: "/logos/MRC_Logo.png", url: "https://sites.google.com/view/marine-robotics-club/home" },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-6 items-center">
+      {logos.map((logo, i) => (
+        <a
+          key={i}
+          href={logo.url}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center justify-center p-4 border rounded-2xl bg-white hover:shadow-md transition"
+        >
+          <img
+            src={logo.src}
+            alt={logo.name}
+            className="max-h-32 object-contain"
+          />
+        </a>
+      ))}
+    </div>
   );
 }
 
@@ -409,6 +437,12 @@ export default function RobotXWebsite() {
               </CardContent>
             </Card>
           </div>
+        </Section>
+        <Section id="logos" title="Our Affiliations" icon={Handshake}>
+          <p className="text-sm text-muted-foreground leading-relaxed mb-6">
+            We are grateful for the organizations supporting our RobotX team.
+          </p>
+          <AffiliateLogos />
         </Section>
 
         <Section id="materials" title="Needed Materials" icon={Plus}>
