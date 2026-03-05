@@ -140,7 +140,7 @@ function TeamEditor() {
     {
       name: "Xavier Vicent Navarro",
       role: "USV/UUV Team Lead",
-      bio: ""
+      bio: "",
     },
   ];
 
