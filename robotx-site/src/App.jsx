@@ -175,7 +175,6 @@ function ContactForm() {
   };
 
   return (
-    <div className="space-y-3">
       <Card className="rounded-2xl">
         <CardHeader>
           <CardTitle>Contact details</CardTitle>
@@ -188,10 +187,6 @@ function ContactForm() {
           <div>
             <div className="text-muted-foreground">Sponsorship</div>
             <div className="font-medium">scruz10@fau.edu</div>
-          </div>
-          <div>
-            <div className="text-muted-foreground">Location</div>
-            <div className="font-medium">Boca Raton, Florida</div>
           </div>
         </CardContent>
       </Card>
