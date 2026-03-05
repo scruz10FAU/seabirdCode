@@ -29,7 +29,7 @@ import {
  * - This is front-end only; forms are demo-only (no backend).
  */
 
-const GOFUNDME_URL = "https://www.gofundme.com/"; // TODO: replace with your campaign
+const GOFUNDME_URL = "https://gofund.me/316a2c928"; // TODO: replace with your campaign
 
 const NAV = [
   { id: "home", label: "RobotX" },
