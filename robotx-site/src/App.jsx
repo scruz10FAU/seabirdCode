@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import materials from "@/data/materials.json";
+import members from "@/data/members.json";
 import {
   Heart,
   Handshake,
@@ -153,18 +154,7 @@ function MaterialsEditor() {
 }
 
 function TeamEditor() {
-  const team = [
-    {
-      name: "Samantha Garcia",
-      role: "UAV Team Lead",
-      bio: "",
-    },
-    {
-      name: "Xavier Vicent Navarro",
-      role: "USV/UUV Team Lead",
-      bio: "",
-    },
-  ];
+  const team = members;
 
   return (
     <div className="grid md:grid-cols-2 gap-4">
