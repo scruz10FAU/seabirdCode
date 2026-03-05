@@ -405,7 +405,6 @@ export default function RobotXWebsite() {
                     </Button>
                   </div>
                   <div className="text-xs text-muted-foreground mt-3">
-                    Replace the link at the top of the file (GOFUNDME_URL) with your actual campaign.
                   </div>
                 </div>
 
