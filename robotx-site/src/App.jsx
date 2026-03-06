@@ -225,12 +225,12 @@ function ContactForm() {
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div>
-            <div className="text-muted-foreground">General email</div>
+            <div className="text-muted-foreground">CAAI Drone Team Email</div>
             <div className="font-medium">birdsim20@gmail.com</div>
           </div>
           <div>
-            <div className="text-muted-foreground">Sponsorship</div>
-            <div className="font-medium">scruz10@fau.edu</div>
+            <div className="text-muted-foreground">MRC Team Email</div>
+            <div className="font-medium">fau.mrc@gmail.com</div>
           </div>
         </CardContent>
       </Card>
