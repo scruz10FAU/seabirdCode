@@ -7,6 +7,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import materials from "@/data/materials.json";
 import members from "@/data/members.json";
+import sponsors from "@/data/sponsors.json";
 import {
   Heart,
   Handshake,
@@ -16,6 +17,7 @@ import {
   Plus,
   Trash2,
   ExternalLink,
+  Star,
 } from "lucide-react";
 
 /**
@@ -31,11 +33,12 @@ import {
  * - This is front-end only; forms are demo-only (no backend).
  */
 
-const GOFUNDME_URL = "https://gofund.me/316a2c928"; // TODO: replace with your campaign
+const GOFUNDME_URL = "https://gofund.me/316a2c928";
 
 const NAV = [
   { id: "home", label: "RobotX" },
   { id: "sponsor", label: "Become a Sponsor" },
+  { id: "sponsor-logos", label: "Our Sponsors" },
   { id: "logos", label: "Affiliations" },
   { id: "materials", label: "Needed Materials" },
   { id: "about", label: "About Us" },
@@ -92,6 +95,28 @@ function SponsorTier({ name, amount, perks }) {
         </ul>
       </CardContent>
     </Card>
+  );
+}
+
+function SponsorLogos() {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-6 items-center">
+      {sponsors.map((logo, i) => (
+        <a
+          key={i}
+          href={logo.url}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center justify-center p-4 border rounded-2xl bg-white hover:shadow-md transition"
+        >
+          <img
+            src={logo.src}
+            alt={logo.name}
+            className="max-h-32 object-contain"
+          />
+        </a>
+      ))}
+    </div>
   );
 }
 
@@ -270,7 +295,7 @@ export default function RobotXWebsite() {
               <Ship className="h-5 w-5" />
             </div>
             <div className="min-w-0">
-              <div className="font-semibold leading-none truncate">RobotX Team</div>
+              <div className="font-semibold leading-none truncate">MRC and CAAI</div>
               <div className="text-xs text-muted-foreground leading-none mt-1 truncate">UAV • USV • UUV</div>
             </div>
           </button>
@@ -453,7 +478,14 @@ export default function RobotXWebsite() {
             </Card>
           </div>
         </Section>
-        <Section id="logos" title="Our Affiliations" icon={Handshake}>
+        <Section id="sponsor-logos" title="Our Sponsors" icon={Handshake}>
+          <p className="text-sm text-muted-foreground leading-relaxed mb-6">
+            Thank you to the sponsors who make our RobotX season possible.
+          </p>
+          <SponsorLogos />
+        </Section>
+
+        <Section id="logos" title="Our Affiliations" icon={Star}>
           <p className="text-sm text-muted-foreground leading-relaxed mb-6">
             We are grateful for the organizations supporting our RobotX team.
           </p>
@@ -494,7 +526,7 @@ export default function RobotXWebsite() {
         <footer className="pt-10 border-t">
           <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3 py-6">
             <div className="text-sm text-muted-foreground">
-              © {new Date().getFullYear()} RobotX Team. All rights reserved.
+              © {new Date().getFullYear()} MRC and CAAI Robot-X Competition Page. All rights reserved.
             </div>
             <div className="flex flex-wrap gap-2">
               <Button variant="ghost" className="rounded-2xl" onClick={() => scrollTo("home")}>Top</Button>
