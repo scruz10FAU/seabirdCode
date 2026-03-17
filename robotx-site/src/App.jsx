@@ -295,7 +295,7 @@ export default function RobotXWebsite() {
               <Ship className="h-5 w-5" />
             </div>
             <div className="min-w-0">
-              <div className="font-semibold leading-none truncate">MRC and CAAI</div>
+              <div className="font-semibold leading-none truncate">SeaOwls</div>
               <div className="text-xs text-muted-foreground leading-none mt-1 truncate">UAV • USV • UUV</div>
             </div>
           </button>
