@@ -181,53 +181,80 @@ function MaterialsEditor() {
 function TeamEditor() {
   const team = members;
 
+  
+  const groups = [
+    { label: "Team Leads", match: (role) => role.toLowerCase().includes("lead") },
+    { label: "UAV Team", match: (role) => role.toLowerCase().includes("uav") },
+    { label: "UUV / USV Team", match: (role) => role.toLowerCase().includes("uuv") || role.toLowerCase().includes("usv") },
+    { label: "Other Members", match: () => true }, // catch-all
+  ];
+
+  
+  const assigned = new Set();
+  const grouped = groups.map((group) => {
+    const groupMembers = team.filter((m, idx) => {
+      if (assigned.has(idx)) return false;
+      if (group.match(m.role)) {
+        assigned.add(idx);
+        return true;
+      }
+      return false;
+    });
+    return { ...group, members: groupMembers };
+  });
+
   return (
-    <div className="grid md:grid-cols-2 gap-4">
-      {team.map((m, idx) => (
-        <Card key={idx} className="rounded-2xl">
-          <CardHeader>
-            <div className="flex items-start gap-4">
+    <div className="space-y-8">
+      {grouped
+        .filter((g) => g.members.length > 0) // hide empty groups
+        .map((group) => (
+          <div key={group.label}>
+            {/* Subtitle */}
+            <h3 className="text-base font-semibold mb-3 text-foreground">
+              {group.label}
+            </h3>
 
-              {/* Profile photo */}
-              <div className="h-14 w-14 rounded-2xl overflow-hidden bg-black/5 dark:bg-white/10 shrink-0">
-                {m.photo ? (
-                  <img src={m.photo} alt={m.name} className="h-full w-full object-cover" />
-                ) : (
-                  <div className="h-full w-full flex items-center justify-center text-xs text-muted-foreground">
-                    Photo
-                  </div>
-                )}
-              </div>
-
-              {/* Name and role */}
-              <div className="min-w-0 flex-1">
-                <CardTitle>
-                  <div className="truncate">{m.name}</div>
-                  <div className="text-sm text-muted-foreground font-normal mt-1">
-                    {m.role || "—"}
-                  </div>
-                </CardTitle>
-              </div>
-
-              {/* LinkedIn button */}
-              {m.linkedin && (
-                <Button asChild variant="secondary" className="rounded-2xl">
-                  <a href={m.linkedin} target="_blank" rel="noreferrer">
-                    LinkedIn
-                  </a>
-                </Button>
-              )}
-
+            <div className="grid md:grid-cols-2 gap-4">
+              {group.members.map((m, idx) => (
+                <Card key={idx} className="rounded-2xl">
+                  <CardHeader>
+                    <div className="flex items-start gap-4">
+                      <div className="h-14 w-14 rounded-2xl overflow-hidden bg-black/5 dark:bg-white/10 shrink-0">
+                        {m.photo ? (
+                          <img src={m.photo} alt={m.name} className="h-full w-full object-cover" />
+                        ) : (
+                          <div className="h-full w-full flex items-center justify-center text-xs text-muted-foreground">
+                            Photo
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <CardTitle>
+                          <div className="truncate">{m.name}</div>
+                          <div className="text-sm text-muted-foreground font-normal mt-1">
+                            {m.role || "—"}
+                          </div>
+                        </CardTitle>
+                      </div>
+                      {m.linkedin && (
+                        <Button asChild variant="secondary" className="rounded-2xl">
+                          <a href={m.linkedin} target="_blank" rel="noreferrer">
+                            LinkedIn
+                          </a>
+                        </Button>
+                      )}
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <p className="text-sm text-muted-foreground leading-relaxed">
+                      {m.bio || ""}
+                    </p>
+                  </CardContent>
+                </Card>
+              ))}
             </div>
-          </CardHeader>
-
-          <CardContent>
-            <p className="text-sm text-muted-foreground leading-relaxed">
-              {m.bio || ""}
-            </p>
-          </CardContent>
-        </Card>
-      ))}
+          </div>
+        ))}
     </div>
   );
 }
