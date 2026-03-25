@@ -14,11 +14,11 @@
     "linkedin": ""
   },
   {
-    "name": "Rodolfo Andrés Rivas Matta",
-    "role": "UAV Computer Engineer Team Member",
-    "bio": "",
-    "photo": "members/rodolfo.jpeg",
-    "linkedin": "https://www.linkedin.com/in/rodolfomatta/"
+    "name": "Jacod Kahn",
+    "role": "UAV Project Manager",
+    "bio": "Drone Club Vice President, Arachna Networks Founder",
+    "photo": "members/headshot edit_Jacob Kahn.png",
+    "linkedin": "https://www.linkedin.com/in/jacob-kahn-650b041bb/"
   },
   {
     "name": "Jaden Cirius",
@@ -30,8 +30,51 @@
   {
     "name": "Skylar Gutman",
     "role": "UAV Electronics Team Member",
-    "bio": "Born with a keyboard in hand and a heart in the sky",
+    "bio": "Born with a keyboard in hand and a heart in the sky.",
     "photo": "members/Skylar-Gutman.jpg",
     "linkedin": "https://www.linkedin.com/in/skylar-gutman-b7114b11/"
+  },
+  {
+    "name": "Tomas Garcia",
+    "role": "UAV Computing, Connectivity and Mechanical Team Member",
+    "bio": "Engineering professional focused on autonomous systems, AI, and robotics. President & Owner of Targa Development, Inc., with experience in computing, advanced communications, and systems design. Passionate about building intelligent, real-world systems that integrate hardware, software, and machine learning.",
+    "photo": "members/Tomas-Garcia.jpeg",
+    "linkedin": "https://www.linkedin.com/in/tomas-garcia-2b36ba29/"
+  },
+  {
+    "name": "Rodolfo Andrés Rivas Matta",
+    "role": "UAV Computer Engineer Team Member",
+    "bio": "",
+    "photo": "members/rodolfo.jpeg",
+    "linkedin": "https://www.linkedin.com/in/rodolfomatta/"
+  },
+  {
+    "name": "Arielle Fishman",
+    "role": "USV Travel Compliance Officer and Electrical Team Member",
+    "bio": "Arielle Fishman is a dual-enrolled electrical engineering student at Florida Atlantic University. She works on the PCB design and development for our Autonomous Surface Vessel. In addition to her technical role, Arielle manages travel compliance and logistics to ensure the team’s successful participation in competitions. She is passionate about autonomous systems and collaborative, hands-on engineering.",
+    "photo": "members/ArielleFishmanHeadshot_Arielle Fishman.png",
+    "linkedin": "https://www.linkedin.com/in/arielle-f-1926482ba/"
+  },
+  {
+    "name": "Adriel Marie Abad",
+    "role": "UAV Data Science Team Member",
+    "bio": "M.S. Artificial Intelligence, B.S. Computer Science. I like most birds, seabird included.",
+    "photo": "",
+    "linkedin": "https://www.linkedin.com/in/adrielmarie"
+  },
+  {
+    "name": "Alex Zurita-Cerezo",
+    "role": "UAV Autonomous Systems Engineer Team Member",
+    "bio": "",
+    "photo": "members/Screenshot 2026-03-25 at 9.09.45 AM_Alex Zurita-Cerezo.png",
+    "linkedin": "www.linkedin.com/in/alexandres-zurita"
+  },
+  {
+    "name": "Kaian Richards",
+    "role": "UAV Mechanical Engineer Team Member",
+    "bio": "Young upcoming engineer that likes hands on projects and likes to work in teams.",
+    "photo": "members/IMG_0368_Kaian Richards.jpeg",
+    "linkedin": ""
   }
+
 ]
