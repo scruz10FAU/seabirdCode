@@ -14,6 +14,13 @@
     "linkedin": ""
   },
   {
+    "name": "Gabriel Garcia",
+    "role": "UAV Project Manager",
+    "bio": "Drone Club President",
+    "photo": "members/Gabriel_Garcia.png",
+    "linkedin": "https://www.linkedin.com/in/gabriel-garcia-44b33b199/"
+  },
+  {
     "name": "Jacob Kahn",
     "role": "UAV Project Manager",
     "bio": "Drone Club Vice President, Arachna Networks Founder",
@@ -23,8 +30,8 @@
   {
     "name": "Jaden Cirius",
     "role": "UAV Computer Science Team Member",
-    "bio": "",
-    "photo": "",
+    "bio": "Computer Science student at Florida Atlantic University (FAU) with focus on the programming, website, and computer aspect of the team.",
+    "photo": "members/Jaden_Ciriuspic.jpg",
     "linkedin": "https://www.linkedin.com/in/jaden-cirius-897b96391/"
   },
   {
@@ -75,6 +82,22 @@
     "bio": "Young upcoming engineer that likes hands on projects and likes to work in teams.",
     "photo": "members/IMG_0368_Kaian Richards.jpeg",
     "linkedin": ""
+  },
+  {
+    "name": "Zoher Marquez Millan",
+    "role": "UAV Mechanical Engineer Team Member",
+    "bio": "Aspiring Mechanical Engineer with a focus on robotics, automation, and CAD design. Combines strong technical knowledge with hands-on experience using SolidWorks to design, and improve mechanical systems.",
+    "photo": "members/portrait_Zoher Marquez.png",
+    "linkedin": "https://www.linkedin.com/in/zoher-marquez-millan-7b57b71a0"
+  },
+  {
+    "name": "Gutenberg Petit-vil",
+    "role": "UAV Robotics Simulation & AI Developer Team Member",
+    "bio": "Gutenberg Petit-vil is a Computer Science student at FAU focused on robotics and AI. He works with NVIDIA Isaac Sim and YOLO to build and test object detection systems, with an interest in real-world autonomous applications.",
+    "photo": "members/Gutenberg Petit-vil.jpg",
+    "linkedin": "https://www.linkedin.com/in/gutenberg-petit-vil-a35a852a9/"
   }
+
+
 
 ]
