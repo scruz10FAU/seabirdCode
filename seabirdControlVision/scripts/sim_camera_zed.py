@@ -13,7 +13,14 @@ Runs as a standalone ROS2 node in a terminal (NOT inside Isaac Script Editor).
 
 Usage:
     source /opt/ros/humble/setup.bash
-    python3 ~/seabird/scripts/sim_camera.py
+    python3 ${ISAAC_ROS_WS}/isaac_ros_assets/scripts/seabirdCode/seabirdControlVision/scripts/sim_camera_zed.py
+
+Load with different model:
+    python3 ${ISAAC_ROS_WS}/isaac_ros_assets/scripts/seabirdCode/seabirdControlVision/scripts/sim_camera_zed.py -m "path/to/model"
+Load with display:
+    python3 ${ISAAC_ROS_WS}/isaac_ros_assets/scripts/seabirdCode/seabirdControlVision/scripts/sim_camera_zed.py -d
+Load true distance of object detected
+    python3 ${ISAAC_ROS_WS}/isaac_ros_assets/scripts/seabirdCode/seabirdControlVision/scripts/sim_camera_zed.py -td <DISTANCE IN METERS>
 
 Prerequisites:
     pip3 install --user opencv-python numpy scipy
@@ -54,12 +61,15 @@ import os
 import cv2
 
 # Default topic prefix — matches init_scene.py's ROS2CameraGraph config
-DEFAULT_TOPIC_PREFIX = "/iris_0/front_cam"
+#DEFAULT_TOPIC_PREFIX = "/iris_0/front_cam"
 DEFAULT_TOPIC_PREFIX = "/zed/zed_node"
 
 # Drone pose topic — published by Pegasus ROS2Backend
-DRONE_POSE_TOPIC = "/drone00/state/pose"
+#DRONE_POSE_TOPIC = "/drone00/state/pose"
 DRONE_POSE_TOPIC = "/zed/zed_node/pose"
+
+# Known ground-truth distance from camera to object (meters)
+#TRUE_DISTANCE = 0.4826
 
 
 class SimCamera(CameraInterface, Node):
@@ -67,9 +77,9 @@ class SimCamera(CameraInterface, Node):
     ROS2-based camera for Isaac Sim.
 
     Subscribes to:
-        /iris_0/front_cam/rgb         — RGB image (rgb8 encoding)
-        /iris_0/front_cam/depth       — depth map (32FC1, meters)
-        /iris_0/front_cam/camera_info — intrinsics (grabbed once)
+        /zed/zed_node/rgb/color/rect/image         — RGB image (rgb8 encoding)
+        /zed/zed_node/depth/depth_registered       — depth map (32FC1, meters)
+        /zed/zed_node/rgb/color/rect/camera_info — intrinsics (grabbed once)
         /drone00/state/pose           — drone pose (PoseStamped from ROS2Backend)
 
     Publishes:
@@ -260,15 +270,10 @@ class SimCamera(CameraInterface, Node):
 
     def _on_synced_frame(self, rgb_msg: Image, depth_msg: Image) -> None:
         channels = len(rgb_msg.data) // (rgb_msg.height * rgb_msg.width)
-        self.get_logger().info(
-            f"[sync] frame received: {rgb_msg.width}x{rgb_msg.height} "
-            f"enc={rgb_msg.encoding} channels={channels}"
-        )
         rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
             rgb_msg.height, rgb_msg.width, channels
         )
         bgr = rgb[:, :, :3][:, :, ::-1].copy()  # RGB(A) → drop alpha if present → BGR
-        self.get_logger().info(f"[sync] bgr shape={bgr.shape} min={bgr.min()} max={bgr.max()}")
         depth = np.frombuffer(depth_msg.data, dtype=np.float32).reshape(
             depth_msg.height, depth_msg.width
         ).copy()
@@ -294,7 +299,7 @@ class SimCamera(CameraInterface, Node):
 
 # ─── Standalone Test ──────────────────────────────────────────────────
 
-def main(model="yolov8s.pt", display=False):
+def main(model="yolov8s.pt", display=False, TRUE_DISTANCE = 0.4826):
     """
     Opens SimCamera with YOLO detection, world-frame validation,
     and publishes detections to /seabird/buoy_detections.
@@ -321,6 +326,8 @@ def main(model="yolov8s.pt", display=False):
         "green_buoy": (0, 255, 0),
         "blue_buoy":  (255, 0, 0),
     }
+
+    KNOWN_DISTANCE = 1.0414  # meters
 
     DEBUG_DIR = os.path.expanduser("~/seabird_dataset/debug_live")
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -394,6 +401,16 @@ def main(model="yolov8s.pt", display=False):
                         if d.tracking_id >= 0:
                             txt += f" #{d.tracking_id}"
 
+                        # Depth error vs known ground-truth distance
+                        if d.position_3d is not None and intr is not None:
+                            cx_px = (d.bbox_2d[0] + d.bbox_2d[2]) // 2
+                            cy_px = (d.bbox_2d[1] + d.bbox_2d[3]) // 2
+                            dx = (cx_px - intr.cx) / intr.fx
+                            dy = (cy_px - intr.cy) / intr.fy
+                            expected_z = TRUE_DISTANCE / np.sqrt(1 + dx**2 + dy**2)
+                            depth_err = d.position_3d[2] - expected_z
+                            txt += f" dz={depth_err:+.3f}m"
+
                         # World-frame transform + validation + publish
                         world_pos = None
                         if d.position_3d is not None and drone_pos is not None:
@@ -401,7 +418,6 @@ def main(model="yolov8s.pt", display=False):
                                 d.position_3d, drone_pos, drone_quat
                             )
                             gt_name, err_m, gt_pos = nearest_buoy_error(world_pos)
-                            txt += f" err={err_m:.2f}m"
 
                             # Publish detection for sweep_and_detect.py
                             det_msg = String()
@@ -427,9 +443,6 @@ def main(model="yolov8s.pt", display=False):
                         cv2.putText(rgb, txt, (x1, y1 - 6),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-                    # Always log detection count so silence is visible
-                    print(f"[sim_camera] Frame {frame_count} | {len(dets)} detection(s)")
-
                     # Periodic console logging with world-frame validation
                     if frame_count % 30 == 0 and dets:
                         print(f"--- Frame {frame_count} | "
@@ -439,9 +452,17 @@ def main(model="yolov8s.pt", display=False):
                         for d in dets:
                             cam_str = ""
                             world_str = ""
+                            depth_err_str = ""
                             if d.position_3d is not None:
                                 cx, cy, cz = d.position_3d
                                 cam_str = f" cam=({cx:.2f},{cy:.2f},{cz:.2f})"
+                                if intr is not None:
+                                    cx_px = (d.bbox_2d[0] + d.bbox_2d[2]) // 2
+                                    cy_px = (d.bbox_2d[1] + d.bbox_2d[3]) // 2
+                                    dx = (cx_px - intr.cx) / intr.fx
+                                    dy = (cy_px - intr.cy) / intr.fy
+                                    expected_z = TRUE_DISTANCE / np.sqrt(1 + dx**2 + dy**2)
+                                    depth_err_str = f" depth_err={cz - expected_z:+.4f}m(measured={cz:.4f} expected={expected_z:.4f})"
                             if d.position_3d is not None and drone_pos is not None:
                                 wp = camera_to_world(
                                     d.position_3d, drone_pos, drone_quat
@@ -453,7 +474,7 @@ def main(model="yolov8s.pt", display=False):
                                     f" err={err_m:.2f}m"
                                 )
                             print(f"  {d.label} conf={d.confidence:.2f} "
-                                  f"tid={d.tracking_id}{cam_str}{world_str}")
+                                  f"tid={d.tracking_id}{cam_str}{depth_err_str}{world_str}")
 
                 # Live display — press 'q' to quit
                 if display and rgb is not None:
@@ -498,5 +519,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog = "Seabird object detector", description = "Run seabird object detector with chosen model")
     parser.add_argument('--model', '-m', default="models/best_alex.pt", type=str, help="enter model paths")
     parser.add_argument('--display', '-d', action='store_true', help="show live cv2 window")
+    parser.add_argument('--true_dist', '-td', type=float, default=0.4826, help="input distance of desired object")
     args = parser.parse_args()
-    main(args.model, args.display)
+    main(args.model, args.display, args.true_dist)
