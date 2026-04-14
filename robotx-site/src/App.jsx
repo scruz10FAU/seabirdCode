@@ -462,19 +462,24 @@ export default function RobotXWebsite() {
 
                 <div className="grid md:grid-cols-3 gap-4">
                   <SponsorTier
+                    name="Copper"
+                    amount= "$500+"
+                    perks={["Logo on website"]}
+                  />
+                  <SponsorTier
                     name="Bronze"
-                    amount="$250+"
-                    perks={["Logo on website", "Social media thank-you", "Sponsor updates"]}
+                    amount="$3,000+"
+                    perks={["Copper perks", "Social media mentions", "Logo on team shirts"]}
                   />
                   <SponsorTier
                     name="Silver"
-                    amount="$1,000+"
-                    perks={["Bronze perks", "Logo on team shirts", "Vehicle logo placement (small)"]}
+                    amount="$6,000+"
+                    perks={["Bronze and Copper perks", "Log on USV, UAV, or UUV"]}
                   />
                   <SponsorTier
                     name="Gold"
                     amount="$5,000+"
-                    perks={["Silver perks", "Vehicle logo placement (large)", "Demo day invite"]}
+                    perks={["Silver, Bronze, and Copper perks", "Logo on home page"]}
                   />
                 </div>
               </CardContent>
