@@ -478,7 +478,7 @@ export default function RobotXWebsite() {
                   />
                   <SponsorTier
                     name="Gold"
-                    amount="$5,000+"
+                    amount="$10,000+"
                     perks={["Silver, Bronze, and Copper perks", "Logo on home page"]}
                   />
                 </div>
