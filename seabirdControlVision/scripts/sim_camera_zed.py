@@ -45,7 +45,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, NavSatFix
 from geometry_msgs.msg import PoseStamped
 import message_filters
 
@@ -59,6 +59,8 @@ from seabird_config import (
 from yolo_detector import YoloDetector
 import os
 import cv2
+from geographic_msgs.msg import GeoPointStamped
+from rclpy.qos import DurabilityPolicy
 
 # Default topic prefix — matches init_scene.py's ROS2CameraGraph config
 #DEFAULT_TOPIC_PREFIX = "/iris_0/front_cam"
@@ -66,11 +68,28 @@ DEFAULT_TOPIC_PREFIX = "/zed/zed_node"
 
 # Drone pose topic — published by Pegasus ROS2Backend
 #DRONE_POSE_TOPIC = "/drone00/state/pose"
-DRONE_POSE_TOPIC = "/zed/zed_node/pose"
+#DRONE_POSE_TOPIC = "/zed/zed_node/pose"
+DRONE_POSE_TOPIC = "/mavros/local_position/pose"
+
+GPS_TOPIC = '/mavros/global_position/gp_origin'
 
 # Known ground-truth distance from camera to object (meters)
 #TRUE_DISTANCE = 0.4826
+EARTH_RADIUS_M = 6378137.0
 
+def local_enu_to_gps(world_pos: np.ndarray,
+                     origin_lat: float,
+                     origin_lon: float,
+                     origin_alt: float) -> Tuple[float, float, float]:
+    """
+    Convert local ENU position (meters from origin) to lat/lon/alt.
+    world_pos: np.array([east, north, up]) in meters
+    Returns: (lat_deg, lon_deg, alt_m)
+    """
+    east, north, up = world_pos[0], world_pos[1], world_pos[2]
+    dlat = np.degrees(north / EARTH_RADIUS_M)
+    dlon = np.degrees(east / (EARTH_RADIUS_M * np.cos(np.radians(origin_lat))))
+    return (origin_lat + dlat, origin_lon + dlon, origin_alt + up)
 
 class SimCamera(CameraInterface, Node):
     """
@@ -104,6 +123,8 @@ class SimCamera(CameraInterface, Node):
         self._drone_pos: Optional[np.ndarray] = None
         self._drone_quat_wxyz: Optional[np.ndarray] = None
         self._pose_lock = threading.Lock()
+        self._gps_origin: Optional[Tuple[float, float, float]] = None #(lat, long, alt)
+        self._gps_origin_lock = threading.Lock()
 
         # State
         self._is_open: bool = False
@@ -172,6 +193,18 @@ class SimCamera(CameraInterface, Node):
             DRONE_POSE_TOPIC,
             self._on_drone_pose,
             qos
+        )
+
+        origin_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1
+        )
+        self._origin_sub = self.create_subscription(
+            GeoPointStamped,
+            GPS_TOPIC,
+            self._on_gps_origin,
+            origin_qos
         )
 
         self._is_open = True
@@ -268,6 +301,23 @@ class SimCamera(CameraInterface, Node):
         )
         self.destroy_subscription(self._info_sub)
 
+    def _on_gps_origin(self, msg: GeoPointStamped) -> None:
+        """Latch the EKF's GPS origin — where local (0,0,0) is on Earth."""
+        with self._gps_origin_lock:
+            self._gps_origin = (
+                msg.position.latitude,
+                msg.position.longitude,
+                msg.position.altitude,
+            )
+        self.get_logger().info(
+            f"GPS origin set: lat={msg.position.latitude:.7f} "
+            f"lon={msg.position.longitude:.7f} alt={msg.position.altitude:.2f}"
+        )
+
+    def get_gps_origin(self) -> Optional[Tuple[float, float, float]]:
+        with self._gps_origin_lock:
+            return self._gps_origin
+        
     def _on_synced_frame(self, rgb_msg: Image, depth_msg: Image) -> None:
         channels = len(rgb_msg.data) // (rgb_msg.height * rgb_msg.width)
         rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
@@ -420,10 +470,18 @@ def main(model="yolov8s.pt", display=False, TRUE_DISTANCE = 0.4826):
                             gt_name, err_m, gt_pos = nearest_buoy_error(world_pos)
 
                             # Publish detection for sweep_and_detect.py
+                            # Compute GPS coordinates if we have the origin
+                            gps_coords = None
+                            origin = cam.get_gps_origin()
+                            if origin is not None:
+                                lat, lon, alt = local_enu_to_gps(world_pos, *origin)
+                                gps_coords = {'latitude': lat, 'longitude': lon, 'altitude': alt}
+
                             det_msg = String()
                             det_msg.data = json.dumps({
                                 'color': d.label.replace('_buoy', ''),
-                                'world_position': world_pos.tolist(),
+                                'world_position': world_pos.tolist(),   # still local ENU (sim-compatible)
+                                'gps_position': gps_coords,              # NEW: lat/lon/alt, or None if no origin yet
                                 'confidence': float(d.confidence),
                                 'drone_position': drone_pos.tolist(),
                                 'timestamp': time.time(),
@@ -473,6 +531,7 @@ def main(model="yolov8s.pt", display=False, TRUE_DISTANCE = 0.4826):
                                     f" → {gt_name} gt={gt_pos}"
                                     f" err={err_m:.2f}m"
                                 )
+                                print(world_str)
                             print(f"  {d.label} conf={d.confidence:.2f} "
                                   f"tid={d.tracking_id}{cam_str}{depth_err_str}{world_str}")
 
