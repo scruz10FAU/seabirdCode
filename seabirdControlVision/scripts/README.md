@@ -121,6 +121,51 @@ Requires YOLO weights at `~/seabird_dataset/runs/v1/weights/best.pt`. Without th
 ### `sim_camera_zed.py`
 **ZED camera variant of SimCamera** with added GPS origin support and depth error validation. Intended for transitioning from simulation to real ZED 2i hardware. Drop-in replacement for `sim_camera.py` — same published topics and `CameraInterface` contract.
 
+Differences from `sim_camera.py`:
+- Subscribes to ZED SDK topic paths (`/zed/zed_node/...`) instead of Isaac's `/iris_0/front_cam/...`
+- Reads drone pose from `/mavros/local_position/pose` instead of Pegasus ROS2Backend
+- Subscribes to `/mavros/global_position/gp_origin` to latch the EKF GPS origin and convert local ENU detections to lat/lon/alt
+- Adds depth error validation: computes expected depth from a known ground-truth object distance and reports the per-frame error as `dz=` on each detection
+- Detection messages include an additional `gps_position` field (`{latitude, longitude, altitude}`) alongside the existing `world_position`
+- Handles RGBA images from the ZED SDK (drops the alpha channel before processing)
+
+**Usage:**
+```bash
+source /opt/ros/humble/setup.bash
+python3 ~/seabird/scripts/sim_camera_zed.py [OPTIONS]
+```
+
+**Arguments:**
+
+| Flag | Short | Type | Default | Description | Options |
+|------|-------|------|---------|-------------|---------|
+| `--model` | `-m` | `str` | `models/best_alex.pt` | Path to YOLO weights file | Any `.pt` file path, or a standard YOLOv8 model name |
+| `--display` | `-d` | flag | `False` | Show a live OpenCV window with annotated detections | Present = enabled, absent = disabled |
+| `--true_dist` | `-td` | `float` | `0.4826` | Known ground-truth distance (meters) from camera to target object, used to compute depth error | Any positive float (meters) |
+
+**Argument details:**
+
+`--model` / `-m` — selects the YOLO weights to load. Accepts either a local `.pt` file path or any standard ultralytics model name (`yolov8n.pt`, `yolov8s.pt`, `yolov8m.pt`, `yolov8l.pt`, `yolov8x.pt`). If the path does not exist and is not a recognized default, detection is disabled and the node runs in RGB-only mode.
+
+`--display` / `-d` — opens a `cv2.imshow` window showing the annotated camera feed in real time. Press `q` in the window to stop the node. Omit this flag when running headless (e.g. over SSH).
+
+`--true_dist` / `-td` — the actual physical distance in meters from the camera to a target object placed at a known location. Used to compute `dz` (depth error): the difference between the measured depth and the expected depth accounting for the pixel's off-center angle. Useful for calibrating or validating depth accuracy. The default (`0.4826 m`) matches the original bench test setup.
+
+**Examples:**
+```bash
+# Default model, no display
+python3 sim_camera_zed.py
+
+# Custom weights with live display
+python3 sim_camera_zed.py -m path/to/best.pt -d
+
+# Validate depth against a target 2 meters away
+python3 sim_camera_zed.py -td 2.0
+
+# Combine all flags
+python3 sim_camera_zed.py -m models/best_rf.pt -d -td 1.5
+```
+
 ---
 
 ### `yolo_detector.py`
