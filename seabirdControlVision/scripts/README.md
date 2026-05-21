@@ -168,6 +168,96 @@ python3 sim_camera_zed.py -m models/best_rf.pt -d -td 1.5
 
 ---
 
+### `beacon_detector.py`
+**Single-class beacon detector with CV-based color classification.** Derived from `sim_camera_zed.py` but uses a model trained on a single `"beacon"` class rather than color-encoded class names. After YOLO locates the beacon, color is determined independently by analyzing the bright pixels inside the bounding box using HSV thresholding.
+
+**Color classification pipeline (runs per detection):**
+1. Crop the bounding box region from the BGR frame
+2. Convert to HSV and mask pixels with high Value (`≥ 160`) and moderate Saturation (`≥ 60`) — isolates the lit/glowing area
+3. Compute the circular mean hue of those pixels (handles the red hue wrap-around at 0°/180°)
+4. Map the mean hue to a color name: `red`, `orange`, `yellow`, `green`, `cyan`, `blue`, `magenta`, `white`, or `unknown`
+
+The detected color and a `color_confidence` (fraction of crop pixels that are lit) are included in every published message.
+
+**Two modes:**
+
+**ROS mode** — subscribes to ZED camera topics and drone pose, same as `sim_camera_zed.py`.
+Publishes to `/seabird/beacon_detections` (JSON over `std_msgs/String`).
+
+**Video mode** (`--video`) — runs entirely without ROS. Loads the model with `ultralytics.YOLO` directly and reads frames from a local video file via `cv2.VideoCapture`. Useful for testing the detection and color pipeline on recorded footage before deploying live.
+
+**Usage (ROS mode):**
+```bash
+source /opt/ros/humble/setup.bash
+python3 beacon_detector.py [OPTIONS]
+```
+
+**Usage (video mode — no ROS required):**
+```bash
+python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
+```
+
+**Arguments:**
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--model` | `-m` | `str` | `models/one_beacon.pt` | Path to the single-class YOLO beacon model |
+| `--display` | `-d` | flag | `False` | Show a live OpenCV window (ROS mode only) |
+| `--true_dist` | `-td` | `float` | `0.4826` | Known ground-truth distance to target in meters, used for depth error reporting (ROS mode) |
+| `--video` | `-v` | `str` | `None` | Path to a local video file — activates video test mode, skips all ROS |
+| `--save` | `-s` | flag | `False` | Save annotated output as `<input>_beacon_out.mp4` alongside the source file (video mode) |
+| `--conf` | `-c` | `float` | `0.5` | YOLO detection confidence threshold (video mode) |
+
+**Argument details:**
+
+`--model` / `-m` — path to a single-class `.pt` model trained to detect `"beacon"` only. Defaults to `models/one_beacon.pt`. Color is never a model output — it is always determined by the CV pipeline after detection.
+
+`--video` / `-v` — when provided, the script runs in video test mode. No `rclpy`, no ROS topics, no drone pose. All ROS-related imports are deferred and never loaded. Press **SPACE** to pause/resume on a frame; press **q** to quit.
+
+`--save` / `-s` — writes the annotated video to `<original_filename>_beacon_out.mp4` in the same directory as the input. Only valid in video mode.
+
+`--conf` / `-c` — YOLO confidence threshold applied in video mode (passed directly to `ultralytics.YOLO`). Tune this down if the beacon is being missed; tune up to reduce false positives.
+
+**Examples:**
+```bash
+# ROS mode — default model, no display
+python3 beacon_detector.py
+
+# ROS mode — custom model with live window
+python3 beacon_detector.py -m models/one_beacon.pt -d
+
+# Video mode — test on recorded footage
+python3 beacon_detector.py -v footage.mp4
+
+# Video mode — lower confidence threshold, save output
+python3 beacon_detector.py -v footage.mp4 -c 0.35 -s
+
+# Video mode — custom model
+python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt
+```
+
+**Published message fields (ROS mode):**
+```json
+{
+  "label":            "beacon",
+  "color":            "red",
+  "color_confidence": 0.42,
+  "confidence":       0.87,
+  "bbox":             [x1, y1, x2, y2],
+  "position_3d":      [x, y, z],
+  "world_position":   [east, north, up],
+  "gps_position":     {"latitude": ..., "longitude": ..., "altitude": ...},
+  "drone_position":   [x, y, z],
+  "tracking_id":      3,
+  "timestamp":        1716300000.0
+}
+```
+
+**Tuning notes:**
+- `_SAT_MIN` and `_VAL_MIN` at the top of the file control the brightness/saturation thresholds for the light isolation mask. Increase `_VAL_MIN` if background objects are being picked up as the light; decrease it if the beacon light is dim and being missed.
+
+---
+
 ### `yolo_detector.py`
 **Pure perception module.** Takes an RGB frame and optionally a depth map, runs YOLOv8 inference, and returns a `List[Detection]`. Knows nothing about ROS2, MAVSDK, world frames, or which camera is active.
 
