@@ -179,64 +179,78 @@ python3 sim_camera_zed.py -m models/best_rf.pt -d -td 1.5
 
 The detected color and a `color_confidence` (fraction of crop pixels that are lit) are included in every published message.
 
-**Two modes:**
+**Three modes:**
 
-**ROS mode** — subscribes to ZED camera topics and drone pose, same as `sim_camera_zed.py`.
-Publishes to `/seabird/beacon_detections` (JSON over `std_msgs/String`).
+| Mode | Flag | ROS node | Frame source | Live display | Publishes |
+|------|------|----------|--------------|--------------|-----------|
+| **ROS** | _(none)_ | Yes — full | ZED camera topics | `-d` flag | `/seabird/beacon_detections` |
+| **Video + ROS** | `--ros-video` | Yes — partial | Local video file | Always on | `/seabird/beacon_detections` |
+| **Video only** | `--video` | No | Local video file | Always on | Nothing |
 
-**Video mode** (`--video`) — runs entirely without ROS. Loads the model with `ultralytics.YOLO` directly and reads frames from a local video file via `cv2.VideoCapture`. Useful for testing the detection and color pipeline on recorded footage before deploying live.
+**ROS mode** subscribes to ZED camera topics and drone pose, same as `sim_camera_zed.py`. Use `-d` to open a display window.
 
-**Usage (ROS mode):**
+**Video + ROS mode** (`--ros-video`) reads frames from a local video file while keeping a live ROS node running. Publishes detections to `/seabird/beacon_detections` and receives drone pose and GPS origin if MAVROS is active. Useful for playing back recorded footage through the full ROS pipeline. Display is always shown.
+
+**Video-only mode** (`--video`) runs with no ROS at all — no `rclpy`, no topics, no drone pose. All ROS imports are deferred and never loaded. Useful for quickly testing detection and color classification on footage without a ROS environment. Display is always shown.
+
+**Usage:**
 ```bash
+# ROS mode (requires sourced ROS environment)
 source /opt/ros/humble/setup.bash
 python3 beacon_detector.py [OPTIONS]
-```
 
-**Usage (video mode — no ROS required):**
-```bash
+# Video + ROS mode (requires sourced ROS environment)
+source /opt/ros/humble/setup.bash
+python3 beacon_detector.py --ros-video path/to/footage.mp4 [OPTIONS]
+
+# Video-only mode (no ROS required)
 python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
 ```
 
 **Arguments:**
 
-| Flag | Short | Type | Default | Description |
-|------|-------|------|---------|-------------|
-| `--model` | `-m` | `str` | `models/one_beacon.pt` | Path to the single-class YOLO beacon model |
-| `--display` | `-d` | flag | `False` | Show a live OpenCV window (ROS mode only) |
-| `--true_dist` | `-td` | `float` | `0.4826` | Known ground-truth distance to target in meters, used for depth error reporting (ROS mode) |
-| `--video` | `-v` | `str` | `None` | Path to a local video file — activates video test mode, skips all ROS |
-| `--save` | `-s` | flag | `False` | Save annotated output as `<input>_beacon_out.mp4` alongside the source file (video mode) |
-| `--conf` | `-c` | `float` | `0.5` | YOLO detection confidence threshold (video mode) |
+| Flag | Short | Type | Default | Mode | Description |
+|------|-------|------|---------|------|-------------|
+| `--model` | `-m` | `str` | `models/one_beacon.pt` | All | Path to the single-class YOLO beacon model |
+| `--display` | `-d` | flag | `False` | ROS only | Show a live OpenCV window |
+| `--true_dist` | `-td` | `float` | `0.4826` | ROS only | Known ground-truth distance to target (meters) for depth error reporting |
+| `--ros-video` | `-rv` | `str` | `None` | — | Path to video file — read frames from file, publish via ROS, show display |
+| `--video` | `-v` | `str` | `None` | — | Path to video file — pure CV test, no ROS |
+| `--save` | `-s` | flag | `False` | Video modes | Save annotated output alongside the source file |
+| `--conf` | `-c` | `float` | `0.5` | Video modes | YOLO detection confidence threshold |
 
 **Argument details:**
 
 `--model` / `-m` — path to a single-class `.pt` model trained to detect `"beacon"` only. Defaults to `models/one_beacon.pt`. Color is never a model output — it is always determined by the CV pipeline after detection.
 
-`--video` / `-v` — when provided, the script runs in video test mode. No `rclpy`, no ROS topics, no drone pose. All ROS-related imports are deferred and never loaded. Press **SPACE** to pause/resume on a frame; press **q** to quit.
+`--ros-video` / `-rv` — initializes a ROS2 node with only the detection publisher and pose/GPS subscribers (no image topic subscriptions). Frames come from `cv2.VideoCapture`. `drone_position` in published messages is populated if MAVROS is running; `position_3d` and `world_position` are `null` since there is no depth map from a video file. Output saved as `<input>_beacon_ros_out.mp4` when `--save` is used.
 
-`--save` / `-s` — writes the annotated video to `<original_filename>_beacon_out.mp4` in the same directory as the input. Only valid in video mode.
+`--video` / `-v` — pure offline test mode. No ROS node is created. Press **SPACE** to pause/resume; press **q** to quit. Output saved as `<input>_beacon_out.mp4` when `--save` is used.
 
-`--conf` / `-c` — YOLO confidence threshold applied in video mode (passed directly to `ultralytics.YOLO`). Tune this down if the beacon is being missed; tune up to reduce false positives.
+`--conf` / `-c` — YOLO confidence threshold for video modes (passed directly to `ultralytics.YOLO`). Tune down if the beacon is being missed; tune up to reduce false positives.
 
 **Examples:**
 ```bash
 # ROS mode — default model, no display
 python3 beacon_detector.py
 
-# ROS mode — custom model with live window
-python3 beacon_detector.py -m models/one_beacon.pt -d
+# ROS mode — with live display window
+python3 beacon_detector.py -d
 
-# Video mode — test on recorded footage
-python3 beacon_detector.py -v footage.mp4
+# Video + ROS — play back footage through the full ROS pipeline
+python3 beacon_detector.py -rv footage.mp4
 
-# Video mode — lower confidence threshold, save output
-python3 beacon_detector.py -v footage.mp4 -c 0.35 -s
+# Video + ROS — save annotated output
+python3 beacon_detector.py -rv footage.mp4 -s
 
-# Video mode — custom model
-python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt
+# Video only — quick offline test, lower confidence threshold
+python3 beacon_detector.py -v footage.mp4 -c 0.35
+
+# Video only — save output, custom model
+python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -s
 ```
 
-**Published message fields (ROS mode):**
+**Published message fields (ROS and Video + ROS modes):**
 ```json
 {
   "label":            "beacon",
@@ -252,6 +266,7 @@ python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt
   "timestamp":        1716300000.0
 }
 ```
+`position_3d`, `world_position`, and `gps_position` are `null` in Video + ROS mode (no depth map available from a video file).
 
 **Tuning notes:**
 - `_SAT_MIN` and `_VAL_MIN` at the top of the file control the brightness/saturation thresholds for the light isolation mask. Increase `_VAL_MIN` if background objects are being picked up as the light; decrease it if the beacon light is dim and being missed.

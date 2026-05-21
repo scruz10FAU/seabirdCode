@@ -222,6 +222,40 @@ class BeaconCamera(Node):
         self.get_logger().info("BeaconCamera open — waiting for frames…")
         return True
 
+    def open_for_video(self) -> bool:
+        """
+        Minimal ROS setup for video-file input mode.
+        Creates the detection publisher and subscribes to drone pose + GPS,
+        but skips all camera image subscriptions (frames come from cv2.VideoCapture).
+        """
+        if self._is_open:
+            return True
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
+
+        self._pose_sub = self.create_subscription(
+            PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
+        )
+
+        origin_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self._origin_sub = self.create_subscription(
+            GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
+        )
+
+        self._is_open = True
+        self.get_logger().info("BeaconCamera open (video-file mode) — pose + GPS only")
+        return True
+
     def close(self) -> None:
         self._is_open = False
 
@@ -451,6 +485,157 @@ def run_video(video_path: str,
         print(f"[beacon-video] Done — {frame_idx} frames processed")
 
 
+# ── Video + ROS mode ──────────────────────────────────────────────────────────
+
+def run_video_ros(video_path: str,
+                  model_path: str = "models/one_beacon.pt",
+                  save_output: bool = False,
+                  conf: float = 0.5) -> None:
+    """
+    Read frames from a local video file, publish detections to ROS, and show
+    a live display window.
+
+    Initializes a ROS2 node for:
+      - Publishing to /seabird/beacon_detections
+      - Receiving drone pose from /mavros/local_position/pose
+      - Receiving GPS origin from /mavros/global_position/gp_origin
+
+    Frames come from cv2.VideoCapture — no camera topic subscriptions needed.
+    Press 'q' to quit, SPACE to pause/resume.
+    """
+    _import_ros()
+
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("[beacon-ros-video] ultralytics not installed: pip install ultralytics")
+        return
+
+    if not os.path.exists(model_path):
+        print(f"[beacon-ros-video] Model not found: {model_path}")
+        return
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[beacon-ros-video] Cannot open video: {video_path}")
+        return
+
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[beacon-ros-video] {video_path}  {width}x{height} @ {fps:.1f}fps  {total} frames")
+    print(f"[beacon-ros-video] Model: {model_path}  conf≥{conf}")
+    print("[beacon-ros-video] Publishing → /seabird/beacon_detections")
+    print("[beacon-ros-video] Press 'q' to quit, SPACE to pause")
+
+    writer = None
+    if save_output:
+        out_path = os.path.splitext(video_path)[0] + "_beacon_ros_out.mp4"
+        fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
+        writer   = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+        print(f"[beacon-ros-video] Saving output → {out_path}")
+
+    rclpy.init()
+    cam   = BeaconCamera()
+    model = YOLO(model_path)
+
+    if not cam.open_for_video():
+        print("[beacon-ros-video] Failed to open ROS node")
+        rclpy.shutdown()
+        cap.release()
+        return
+
+    frame_idx = 0
+    paused    = False
+
+    try:
+        while rclpy.ok():
+            # Spin once to receive latest pose / GPS
+            rclpy.spin_once(cam, timeout_sec=0.0)
+
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    print("[beacon-ros-video] End of video")
+                    break
+                frame_idx += 1
+
+                drone_pos, _ = cam.get_drone_pose()
+
+                results = model(frame, conf=conf, verbose=False)
+                boxes   = results[0].boxes
+
+                print(f"Frame {frame_idx}/{total} — {len(boxes)} detection(s)")
+
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    det_conf = float(box.conf[0])
+
+                    crop = frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
+                    beacon_color, color_conf, light_mask = classify_beacon_color(crop)
+                    draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
+
+                    if light_mask is not None and light_mask.any():
+                        lm_full = np.zeros(frame.shape[:2], dtype=np.uint8)
+                        lm_h = min(light_mask.shape[0], y2 - y1)
+                        lm_w = min(light_mask.shape[1], x2 - x1)
+                        lm_full[y1:y1+lm_h, x1:x1+lm_w] = light_mask[:lm_h, :lm_w]
+                        tint = np.zeros_like(frame)
+                        tint[:] = draw_color
+                        frame[lm_full > 0] = cv2.addWeighted(
+                            frame, 0.5, tint, 0.5, 0
+                        )[lm_full > 0]
+
+                    label_txt = (
+                        f"beacon [{beacon_color}] "
+                        f"det={det_conf:.2f} col={color_conf:.2f}"
+                    )
+                    cv2.putText(frame, label_txt, (x1, max(y1 - 6, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1)
+
+                    # Publish to ROS
+                    msg = String()
+                    msg.data = json.dumps({
+                        "label":            "beacon",
+                        "color":            beacon_color,
+                        "color_confidence": color_conf,
+                        "confidence":       det_conf,
+                        "bbox":             [x1, y1, x2, y2],
+                        "position_3d":      None,
+                        "world_position":   None,
+                        "gps_position":     None,
+                        "drone_position":   drone_pos.tolist() if drone_pos is not None else None,
+                        "tracking_id":      -1,
+                        "timestamp":        time.time(),
+                    })
+                    cam.detection_pub.publish(msg)
+                    print(f"  {label_txt}")
+
+                if writer:
+                    writer.write(frame)
+
+            cv2.imshow("Beacon Detector — Video + ROS", frame)
+            key = cv2.waitKey(1 if not paused else 50) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord(" "):
+                paused = not paused
+
+    except KeyboardInterrupt:
+        print("\n[beacon-ros-video] Interrupted")
+    finally:
+        cap.release()
+        if writer:
+            writer.release()
+        cam.close()
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
+        print(f"[beacon-ros-video] Done — {frame_idx} frames processed")
+
+
 # ── Main loop (ROS mode) ───────────────────────────────────────────────────────
 
 def main(model: str = "models/one_beacon.pt",
@@ -627,22 +812,31 @@ if __name__ == "__main__":
         default=None,
         type=str,
         metavar="VIDEO_PATH",
-        help="Test on a local video file instead of ROS topics (no ROS needed)",
+        help="Test on a local video file — no ROS, pure CV only",
+    )
+    parser.add_argument(
+        "--ros-video", "-rv",
+        default=None,
+        type=str,
+        metavar="VIDEO_PATH",
+        help="Read frames from a video file AND publish detections to ROS topics",
     )
     parser.add_argument(
         "--save", "-s",
         action="store_true",
-        help="Save annotated output video alongside the input (video mode only)",
+        help="Save annotated output video alongside the input (video modes only)",
     )
     parser.add_argument(
         "--conf", "-c",
         type=float,
         default=0.5,
-        help="Detection confidence threshold (video mode, default 0.5)",
+        help="Detection confidence threshold (video modes, default 0.5)",
     )
     args = parser.parse_args()
 
-    if args.video is not None:
+    if args.ros_video is not None:
+        run_video_ros(args.ros_video, model_path=args.model, save_output=args.save, conf=args.conf)
+    elif args.video is not None:
         run_video(args.video, model_path=args.model, save_output=args.save, conf=args.conf)
     else:
         main(args.model, args.display, args.true_dist)
