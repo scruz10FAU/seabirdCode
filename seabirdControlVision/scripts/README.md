@@ -177,13 +177,15 @@ python3 sim_camera_zed.py -m models/best_rf.pt -d -td 1.5
 |-------|----------------|---------|
 | **Stage 1 — Detection** | `one_beacon.pt` | Locate the beacon in the full frame; output: bounding box |
 | **Stage 2 — Lit-area isolation** | `best_crop.pt` | Run on the beacon crop; output: tighter bbox or segmentation mask around the glowing region |
-| **Stage 3 — Color classification** | HSV thresholding | Convert the isolated lit region to HSV, compute circular mean hue, map to color name + measure intensity |
+| **Stage 3 — Color classification** | Per-pixel hue voting | Each lit pixel votes for whichever color band its hue falls in; the majority color wins |
 
-Stage 2 supports both detection-output and segmentation-output models. If `best_crop.pt` finds nothing in the crop, Stage 3 falls back to HSV thresholding directly on the full beacon crop.
+Stage 2 supports both detection-output and segmentation-output models. If `best_crop.pt` finds nothing in the crop, Stage 3 runs directly on the full beacon crop.
 
 **Supported colors:** `red`, `green`, `blue`, `white`, `unknown`.
 
-**Intensity** is reported alongside every color result (0.0–1.0, mean brightness of the lit pixels). This is especially useful for blue beacons, which can be difficult to distinguish from "off" in daylight — a genuine blue beacon will have a higher intensity reading than an unlit or ambient-light false positive.
+**Per-pixel hue voting** (Stage 3): every bright, saturated pixel in the isolated region is tested against the defined hue bands (`_HUE_BANDS` in the source). The fraction of pixels that fall in each band is computed — `vote_red`, `vote_green`, `vote_blue`, `vote_other` — and the color with the highest vote wins. A color must hold ≥ 30% of lit pixels to be declared the winner; otherwise the result is `"unknown"`. This is more robust than averaging hues because a handful of stray pixels cannot swing the result across a band boundary.
+
+**Intensity** is reported alongside every color result (0.0–1.0, mean HSV brightness of the lit pixels). This is especially useful for blue beacons, which can be difficult to distinguish from "off" in daylight — a genuine blue beacon will have a higher intensity reading than an unlit or ambient-light false positive.
 
 The detected color and a `color_confidence` (fraction of crop pixels that are lit) are included in every published message.
 
@@ -241,7 +243,7 @@ python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
 
 `--conf` / `-c` — YOLO confidence threshold applied to both Stage 1 and Stage 2 in video modes (passed directly to `ultralytics.YOLO`). Tune down if the beacon or its lit area is being missed; tune up to reduce false positives.
 
-`--log` / `-l` — writes a CSV file with one row per detection per frame. In video modes the file is named `<input>_beacon_log_<timestamp>.csv` and saved alongside the video. In ROS mode it is written to `~/seabird_dataset/beacon_debug/beacon_log_<timestamp>.csv`. Columns: `timestamp`, `frame`, `color`, `color_confidence`, `intensity`, `det_confidence`, `x1`, `y1`, `x2`, `y2`, `tracking_id`, `pos3d_x`, `pos3d_y`, `pos3d_z`.
+`--log` / `-l` — writes a CSV file with one row per detection per frame. In video modes the file is named `<input>_beacon_log_<timestamp>.csv` and saved alongside the video. In ROS mode it is written to `~/seabird_dataset/beacon_debug/beacon_log_<timestamp>.csv`. Columns: `timestamp`, `frame`, `color`, `color_confidence`, `intensity`, `vote_red`, `vote_green`, `vote_blue`, `vote_other`, `det_confidence`, `x1`, `y1`, `x2`, `y2`, `tracking_id`, `pos3d_x`, `pos3d_y`, `pos3d_z`. The four `vote_*` columns are the per-pixel hue vote fractions and are the primary tool for diagnosing mis-classifications.
 
 **Examples:**
 ```bash
@@ -267,6 +269,12 @@ python3 beacon_detector.py -v footage.mp4 -c 0.35
 python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -cm models/best_crop.pt -s
 ```
 
+**Display overlay format:**
+```
+beacon [green] det=0.87 int=0.74  r=3%  g=81%  b=2%
+```
+The `r/g/b` percentages are the live hue vote fractions for that detection. `"other"` pixels (hue in a gap between bands) are not shown on screen but are recorded in the CSV and JSON.
+
 **Published message fields (ROS and Video + ROS modes):**
 ```json
 {
@@ -274,6 +282,7 @@ python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -cm models/bes
   "color":            "blue",
   "color_confidence": 0.42,
   "intensity":        0.71,
+  "hue_votes":        {"red": 0.04, "green": 0.05, "blue": 0.76, "other": 0.15},
   "confidence":       0.87,
   "bbox":             [x1, y1, x2, y2],
   "position_3d":      [x, y, z],
@@ -288,10 +297,14 @@ python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -cm models/bes
 
 `intensity` is the mean HSV Value of the lit pixels, normalized 0.0–1.0. For a `"blue"` result, values below ~0.4 suggest the beacon may be off or too dim to classify reliably in daylight.
 
+`hue_votes` fractions sum to 1.0. `"other"` is the fraction of lit pixels whose hue falls in a gap between the defined bands.
+
 **Tuning notes:**
-- `_SAT_MIN` and `_VAL_MIN` at the top of the file control the HSV thresholds used in the Stage 3 color classification fallback. Increase `_VAL_MIN` if background objects are picked up as lit; decrease it if the beacon light is dim and being missed.
-- The Stage 2 confidence threshold is hardcoded at `0.3` in `isolate_and_classify()` — lower than the main detection threshold to prefer finding something rather than falling back to full-crop HSV.
-- To flag a potentially-off blue beacon in consuming code, check `color == "blue" and intensity < 0.4`.
+- `_SAT_MIN` and `_VAL_MIN` at the top of the file control which pixels count as "lit". Increase `_VAL_MIN` if background objects are picked up; decrease it if a dim beacon is being missed.
+- `_HUE_BANDS` defines the strict hue ranges for red, green, and blue. Each band is `(center, half_width, label)` in OpenCV degrees (0–180). Gaps between bands are intentional — ambiguous hues fall to `"other"` rather than mis-snapping to the nearest color. If a known color is misclassified, run with `--log` and inspect the `vote_*` columns to find where the pixels are actually landing, then widen the corresponding band.
+- The Stage 2 confidence threshold is hardcoded at `0.3` in `isolate_and_classify()` — lower than the main detection threshold to prefer finding something rather than falling back to full-crop analysis.
+- A color must win ≥ 30% of lit-pixel votes to be declared the result. Below that threshold the result is `"unknown"`.
+- To flag a potentially-off blue beacon in consuming code: `color == "blue" and intensity < 0.4`.
 
 ---
 
