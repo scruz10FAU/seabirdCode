@@ -288,38 +288,55 @@ _VAL_MIN = 160   # only consider bright pixels (the light itself)
 
 # Hue bands for the four supported beacon colors (degrees, 0-180 in OpenCV).
 # Each entry: (hue_center, half_width, label)
+# Bands use STRICT membership — a hue must fall within center±half_width to match.
+# Gaps between bands intentionally fall through to "unknown" rather than mis-snap.
 _HUE_BANDS = [
     (  0, 15, "red"),    # 0–15
-    ( 60, 25, "green"),  # 35–85
-    (115, 20, "blue"),   # 95–135  ← blue is hardest to see in daylight; check intensity
+    ( 65, 30, "green"),  # 35–95  (wide to cover teal-ish LEDs)
+    (120, 15, "blue"),   # 105–135 (gap at 95–105 prevents green→blue mis-snap)
     (165, 15, "red"),    # 150–180 (wrap-around)
 ]
 
 
-def _circular_mean_hue(hues: np.ndarray) -> float:
-    """Circular mean of hue values (0-179 → 0-π radians × 2)."""
-    angles = hues.astype(np.float32) * (2 * np.pi / 180.0)
-    sin_mean = np.mean(np.sin(angles))
-    cos_mean = np.mean(np.cos(angles))
-    mean_angle = np.arctan2(sin_mean, cos_mean)
-    if mean_angle < 0:
-        mean_angle += 2 * np.pi
-    return float(mean_angle * 180.0 / (2 * np.pi))   # back to 0-180
+def _hue_votes(hues: np.ndarray) -> dict:
+    """
+    For each lit pixel, check which hue band it belongs to (strict membership).
+    Returns fraction of lit pixels in each color: {"red", "green", "blue", "other"}.
+    "other" = pixels whose hue does not fall in any defined band (gaps/ambiguous).
+    """
+    n = max(len(hues), 1)
+    counts = {"red": 0, "green": 0, "blue": 0, "other": 0}
+    for hue in hues:
+        matched = False
+        for center, half, label in _HUE_BANDS:
+            dist = abs(int(hue) - center)
+            dist = min(dist, 180 - dist)
+            if dist <= half:
+                counts[label] += 1
+                matched = True
+                break
+        if not matched:
+            counts["other"] += 1
+    return {k: counts[k] / n for k in counts}
 
 
-def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray, float]:
+def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray, float, dict]:
     """
     Given a BGR crop of a beacon bounding box, return:
-        (color_name, color_confidence, light_mask, intensity)
+        (color_name, color_confidence, light_mask, intensity, hue_votes)
 
     color_confidence: fraction of crop pixels that are "lit" (higher = cleaner read).
     light_mask:       uint8 mask of the bright pixels used (same H×W as crop).
     intensity:        mean brightness (Value channel) of lit pixels, 0.0–1.0.
                       Low intensity on a "blue" result may indicate the beacon is off
                       or too dim to read reliably in daylight.
+    hue_votes:        {"red": 0.0–1.0, "green": 0.0–1.0, "blue": 0.0–1.0, "other": 0.0–1.0}
+                      Fraction of lit pixels that fall in each color's hue band.
+                      Useful for diagnosing mis-classifications and tuning _HUE_BANDS.
     """
+    _empty_votes = {"red": 0.0, "green": 0.0, "blue": 0.0, "other": 0.0}
     if bgr_crop is None or bgr_crop.size == 0:
-        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0
+        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0, _empty_votes
 
     hsv = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -337,33 +354,25 @@ def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray,
         bright_count = int(np.count_nonzero(very_bright))
         if bright_count > total_pixels * 0.1:
             intensity = float(np.mean(v[very_bright]) / 255.0)
-            return "white", float(bright_count / total_pixels), light_mask, intensity
-        return "unknown", 0.0, light_mask, 0.0
+            return "white", float(bright_count / total_pixels), light_mask, intensity, _empty_votes
+        return "unknown", 0.0, light_mask, 0.0, _empty_votes
 
     hues      = h[light_mask > 0]
-    mean_hue  = _circular_mean_hue(hues)
     intensity = float(np.mean(v[light_mask > 0]) / 255.0)
 
-    # Map mean hue to the closest of: red, green, blue.
-    # If nothing is within half_width, fall back to white (bright but unsaturated).
-    best_label = "white"
-    best_dist  = 180.0
-    for center, half, label in _HUE_BANDS:
-        dist = abs(mean_hue - center)
-        dist = min(dist, 180.0 - dist)   # circular distance
-        if dist < best_dist:
-            best_dist  = dist
-            best_label = label
+    # Per-pixel hue vote — majority of lit pixels determines the color.
+    # More robust than a single mean hue: outlier pixels don't skew the result.
+    votes = _hue_votes(hues)
+    winner = max(("red", "green", "blue"), key=lambda c: votes[c])
 
-    # If the closest hue band is still outside its half-width, treat as white
-    if best_dist > max(half for _, half, _ in _HUE_BANDS):
-        best_label = "white"
+    # Require the winner to hold at least 30% of lit pixels to avoid noise wins
+    color = winner if votes[winner] >= 0.30 else "unknown"
 
-    return best_label, color_conf, light_mask, intensity
+    return color, color_conf, light_mask, intensity, votes
 
 
 def isolate_and_classify(beacon_crop: np.ndarray, crop_model,
-                         conf: float = 0.3) -> Tuple[str, float, np.ndarray, float]:
+                         conf: float = 0.3) -> Tuple[str, float, np.ndarray, float, dict]:
     """
     Run best_crop.pt on a beacon bounding-box crop to find the lit area,
     then classify its color.
@@ -372,15 +381,17 @@ def isolate_and_classify(beacon_crop: np.ndarray, crop_model,
     models (returns a pixel mask). Falls back to classify_beacon_color on
     the full crop if the model finds nothing.
 
-    Returns: (color_name, color_confidence, display_mask, intensity)
+    Returns: (color_name, color_confidence, display_mask, intensity, hue_votes)
         display_mask — uint8 mask the same H×W as beacon_crop;
                        255 where the lit area is, 0 elsewhere.
         intensity    — mean brightness (Value) of lit pixels, 0.0–1.0.
-                       Low intensity on a "blue" result suggests the beacon
-                       may be off or too dim to classify reliably in daylight.
+        hue_votes    — {"red", "green", "blue", "other"} fraction of lit pixels
+                       in each color's hue band; useful for diagnosing results.
     """
+    _empty = ("unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0,
+              {"red": 0.0, "green": 0.0, "blue": 0.0, "other": 0.0})
     if beacon_crop is None or beacon_crop.size == 0:
-        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0
+        return _empty
 
     h, w = beacon_crop.shape[:2]
     display_mask = np.zeros((h, w), dtype=np.uint8)
@@ -416,14 +427,15 @@ def isolate_and_classify(beacon_crop: np.ndarray, crop_model,
     cmin, cmax = np.where(cols)[0][[0, -1]]
     lit_region = beacon_crop[rmin:rmax + 1, cmin:cmax + 1]
 
-    color, color_conf, _, intensity = classify_beacon_color(lit_region)
-    return color, color_conf, display_mask, intensity
+    color, color_conf, _, intensity, votes = classify_beacon_color(lit_region)
+    return color, color_conf, display_mask, intensity, votes
 
 
 # ── Detection logger ──────────────────────────────────────────────────────────
 
 _LOG_HEADER = [
     "timestamp", "frame", "color", "color_confidence", "intensity",
+    "vote_red", "vote_green", "vote_blue", "vote_other",
     "det_confidence", "x1", "y1", "x2", "y2", "tracking_id",
     "pos3d_x", "pos3d_y", "pos3d_z",
 ]
@@ -439,16 +451,19 @@ def _open_log(path: str):
 
 
 def _write_log_row(log_writer, frame_idx: int, color: str,
-                   color_conf: float, intensity: float, det_conf: float,
-                   bbox, tracking_id: int = -1, pos3d=None) -> None:
+                   color_conf: float, intensity: float, votes: dict,
+                   det_conf: float, bbox, tracking_id: int = -1,
+                   pos3d=None) -> None:
     x1, y1, x2, y2 = bbox
     px = py = pz = ""
     if pos3d is not None:
         px, py, pz = f"{pos3d[0]:.4f}", f"{pos3d[1]:.4f}", f"{pos3d[2]:.4f}"
     log_writer.writerow([
         f"{time.time():.3f}", frame_idx,
-        color, f"{color_conf:.4f}", f"{intensity:.4f}", f"{det_conf:.4f}",
-        x1, y1, x2, y2, tracking_id,
+        color, f"{color_conf:.4f}", f"{intensity:.4f}",
+        f"{votes.get('red',0):.4f}", f"{votes.get('green',0):.4f}",
+        f"{votes.get('blue',0):.4f}", f"{votes.get('other',0):.4f}",
+        f"{det_conf:.4f}", x1, y1, x2, y2, tracking_id,
         px, py, pz,
     ])
 
@@ -486,7 +501,7 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
         label = names.get(cls, str(cls))
 
         crop = frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-        beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
+        beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
         draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
@@ -501,15 +516,16 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
             tint[:] = draw_color
             frame[lm_full > 0] = cv2.addWeighted(frame, 0.5, tint, 0.5, 0)[lm_full > 0]
 
-        txt = f"{label} [{beacon_color}] det={conf:.2f} col={color_conf:.2f} int={intensity:.2f}"
+        txt = (f"{label} [{beacon_color}] det={conf:.2f} int={intensity:.2f} "
+               f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}")
         cv2.putText(frame, txt, (x1, max(y1 - 6, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
 
         print(f"  {txt}  bbox=({x1},{y1},{x2},{y2})")
 
         if log_writer is not None:
             _write_log_row(log_writer, frame_idx, beacon_color, color_conf,
-                           intensity, conf, (x1, y1, x2, y2))
+                           intensity, votes, conf, (x1, y1, x2, y2))
 
     return frame
 
@@ -723,7 +739,7 @@ def run_video_ros(video_path: str,
                     det_conf = float(box.conf[0])
 
                     crop = display_frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-                    beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
+                    beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
                     draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), draw_color, 2)
@@ -740,11 +756,11 @@ def run_video_ros(video_path: str,
                         )[lm_full > 0]
 
                     label_txt = (
-                        f"beacon [{beacon_color}] "
-                        f"det={det_conf:.2f} col={color_conf:.2f} int={intensity:.2f}"
+                        f"beacon [{beacon_color}] det={det_conf:.2f} int={intensity:.2f} "
+                        f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}"
                     )
                     cv2.putText(display_frame, label_txt, (x1, max(y1 - 6, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
 
                     # Publish to ROS
                     msg = String()
@@ -753,6 +769,7 @@ def run_video_ros(video_path: str,
                         "color":            beacon_color,
                         "color_confidence": color_conf,
                         "intensity":        intensity,
+                        "hue_votes":        votes,
                         "confidence":       det_conf,
                         "bbox":             [x1, y1, x2, y2],
                         "position_3d":      None,
@@ -767,7 +784,7 @@ def run_video_ros(video_path: str,
 
                     if log_writer is not None:
                         _write_log_row(log_writer, frame_idx, beacon_color, color_conf,
-                                       intensity, det_conf, (x1, y1, x2, y2))
+                                       intensity, votes, det_conf, (x1, y1, x2, y2))
 
                 if writer:
                     writer.write(display_frame)
@@ -879,7 +896,7 @@ def main(model: str = "models/one_beacon.pt",
 
                 # ── Color determination from the beacon's light area ──────────
                 crop = rgb[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-                beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
+                beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
                 # ─────────────────────────────────────────────────────────────
 
                 draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
@@ -899,9 +916,8 @@ def main(model: str = "models/one_beacon.pt",
                     )[lm_full > 0]
 
                 label_txt = (
-                    f"beacon [{beacon_color}] "
-                    f"conf={d.confidence:.2f} "
-                    f"col={color_conf:.2f} int={intensity:.2f}"
+                    f"beacon [{beacon_color}] conf={d.confidence:.2f} int={intensity:.2f} "
+                    f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}"
                 )
                 if d.tracking_id >= 0:
                     label_txt += f" #{d.tracking_id}"
@@ -933,6 +949,7 @@ def main(model: str = "models/one_beacon.pt",
                     "color":            beacon_color,
                     "color_confidence": color_conf,
                     "intensity":        intensity,
+                    "hue_votes":        votes,
                     "confidence":       float(d.confidence),
                     "bbox":           list(d.bbox_2d),
                     "position_3d":    d.position_3d.tolist() if d.position_3d is not None else None,
@@ -946,7 +963,7 @@ def main(model: str = "models/one_beacon.pt",
 
                 if log_writer is not None:
                     _write_log_row(log_writer, frame_count, beacon_color, color_conf,
-                                   intensity, float(d.confidence), d.bbox_2d,
+                                   intensity, votes, float(d.confidence), d.bbox_2d,
                                    tracking_id=d.tracking_id,
                                    pos3d=d.position_3d)
 
