@@ -169,13 +169,21 @@ python3 sim_camera_zed.py -m models/best_rf.pt -d -td 1.5
 ---
 
 ### `beacon_detector.py`
-**Single-class beacon detector with CV-based color classification.** Derived from `sim_camera_zed.py` but uses a model trained on a single `"beacon"` class rather than color-encoded class names. After YOLO locates the beacon, color is determined independently by analyzing the bright pixels inside the bounding box using HSV thresholding.
+**Two-stage beacon detector with YOLO-guided color classification.** Derived from `sim_camera_zed.py` but uses a dedicated single-class `"beacon"` model for localization, then runs a second YOLO model on the cropped beacon to isolate the lit area before classifying its color via HSV analysis.
 
-**Color classification pipeline (runs per detection):**
-1. Crop the bounding box region from the BGR frame
-2. Convert to HSV and mask pixels with high Value (`≥ 160`) and moderate Saturation (`≥ 60`) — isolates the lit/glowing area
-3. Compute the circular mean hue of those pixels (handles the red hue wrap-around at 0°/180°)
-4. Map the mean hue to a color name: `red`, `orange`, `yellow`, `green`, `cyan`, `blue`, `magenta`, `white`, or `unknown`
+**Three-stage pipeline (runs per detection):**
+
+| Stage | Model / method | Purpose |
+|-------|----------------|---------|
+| **Stage 1 — Detection** | `one_beacon.pt` | Locate the beacon in the full frame; output: bounding box |
+| **Stage 2 — Lit-area isolation** | `best_crop.pt` | Run on the beacon crop; output: tighter bbox or segmentation mask around the glowing region |
+| **Stage 3 — Color classification** | HSV thresholding | Convert the isolated lit region to HSV, compute circular mean hue, map to color name + measure intensity |
+
+Stage 2 supports both detection-output and segmentation-output models. If `best_crop.pt` finds nothing in the crop, Stage 3 falls back to HSV thresholding directly on the full beacon crop.
+
+**Supported colors:** `red`, `green`, `blue`, `white`, `unknown`.
+
+**Intensity** is reported alongside every color result (0.0–1.0, mean brightness of the lit pixels). This is especially useful for blue beacons, which can be difficult to distinguish from "off" in daylight — a genuine blue beacon will have a higher intensity reading than an unlit or ambient-light false positive.
 
 The detected color and a `color_confidence` (fraction of crop pixels that are lit) are included in every published message.
 
@@ -211,51 +219,61 @@ python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
 
 | Flag | Short | Type | Default | Mode | Description |
 |------|-------|------|---------|------|-------------|
-| `--model` | `-m` | `str` | `models/one_beacon.pt` | All | Path to the single-class YOLO beacon model |
+| `--model` | `-m` | `str` | `models/one_beacon.pt` | All | Path to the Stage 1 YOLO beacon localization model |
+| `--crop-model` | `-cm` | `str` | `models/best_crop.pt` | All | Path to the Stage 2 YOLO lit-area isolation model |
 | `--display` | `-d` | flag | `False` | ROS only | Show a live OpenCV window |
 | `--true_dist` | `-td` | `float` | `0.4826` | ROS only | Known ground-truth distance to target (meters) for depth error reporting |
 | `--ros-video` | `-rv` | `str` | `None` | — | Path to video file — read frames from file, publish via ROS, show display |
 | `--video` | `-v` | `str` | `None` | — | Path to video file — pure CV test, no ROS |
 | `--save` | `-s` | flag | `False` | Video modes | Save annotated output alongside the source file |
 | `--conf` | `-c` | `float` | `0.5` | Video modes | YOLO detection confidence threshold |
+| `--log` | `-l` | flag | `False` | All | Save a CSV detection log with color, intensity, confidence, and bbox per detection |
 
 **Argument details:**
 
-`--model` / `-m` — path to a single-class `.pt` model trained to detect `"beacon"` only. Defaults to `models/one_beacon.pt`. Color is never a model output — it is always determined by the CV pipeline after detection.
+`--model` / `-m` — path to a single-class `.pt` model trained to detect `"beacon"` only (Stage 1). Defaults to `models/one_beacon.pt`. Color is never an output of this model.
+
+`--crop-model` / `-cm` — path to the Stage 2 `.pt` model that isolates the lit/glowing area within a beacon crop. Accepts both detection and segmentation model types. Defaults to `models/best_crop.pt`. If the file is missing at startup, the script exits with an error message.
 
 `--ros-video` / `-rv` — initializes a ROS2 node with only the detection publisher and pose/GPS subscribers (no image topic subscriptions). Frames come from `cv2.VideoCapture`. `drone_position` in published messages is populated if MAVROS is running; `position_3d` and `world_position` are `null` since there is no depth map from a video file. Output saved as `<input>_beacon_ros_out.mp4` when `--save` is used.
 
 `--video` / `-v` — pure offline test mode. No ROS node is created. Press **SPACE** to pause/resume; press **q** to quit. Output saved as `<input>_beacon_out.mp4` when `--save` is used.
 
-`--conf` / `-c` — YOLO confidence threshold for video modes (passed directly to `ultralytics.YOLO`). Tune down if the beacon is being missed; tune up to reduce false positives.
+`--conf` / `-c` — YOLO confidence threshold applied to both Stage 1 and Stage 2 in video modes (passed directly to `ultralytics.YOLO`). Tune down if the beacon or its lit area is being missed; tune up to reduce false positives.
+
+`--log` / `-l` — writes a CSV file with one row per detection per frame. In video modes the file is named `<input>_beacon_log_<timestamp>.csv` and saved alongside the video. In ROS mode it is written to `~/seabird_dataset/beacon_debug/beacon_log_<timestamp>.csv`. Columns: `timestamp`, `frame`, `color`, `color_confidence`, `intensity`, `det_confidence`, `x1`, `y1`, `x2`, `y2`, `tracking_id`, `pos3d_x`, `pos3d_y`, `pos3d_z`.
 
 **Examples:**
 ```bash
-# ROS mode — default model, no display
+# ROS mode — default models, no display
 python3 beacon_detector.py
 
 # ROS mode — with live display window
 python3 beacon_detector.py -d
 
+# ROS mode — custom crop model
+python3 beacon_detector.py -cm models/best_crop_v2.pt -d
+
 # Video + ROS — play back footage through the full ROS pipeline
 python3 beacon_detector.py -rv footage.mp4
 
-# Video + ROS — save annotated output
-python3 beacon_detector.py -rv footage.mp4 -s
+# Video + ROS — save annotated output, custom crop model
+python3 beacon_detector.py -rv footage.mp4 -cm models/best_crop.pt -s
 
 # Video only — quick offline test, lower confidence threshold
 python3 beacon_detector.py -v footage.mp4 -c 0.35
 
-# Video only — save output, custom model
-python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -s
+# Video only — save output, specify both models explicitly
+python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -cm models/best_crop.pt -s
 ```
 
 **Published message fields (ROS and Video + ROS modes):**
 ```json
 {
   "label":            "beacon",
-  "color":            "red",
+  "color":            "blue",
   "color_confidence": 0.42,
+  "intensity":        0.71,
   "confidence":       0.87,
   "bbox":             [x1, y1, x2, y2],
   "position_3d":      [x, y, z],
@@ -268,8 +286,12 @@ python3 beacon_detector.py -v footage.mp4 -m models/one_beacon.pt -s
 ```
 `position_3d`, `world_position`, and `gps_position` are `null` in Video + ROS mode (no depth map available from a video file).
 
+`intensity` is the mean HSV Value of the lit pixels, normalized 0.0–1.0. For a `"blue"` result, values below ~0.4 suggest the beacon may be off or too dim to classify reliably in daylight.
+
 **Tuning notes:**
-- `_SAT_MIN` and `_VAL_MIN` at the top of the file control the brightness/saturation thresholds for the light isolation mask. Increase `_VAL_MIN` if background objects are being picked up as the light; decrease it if the beacon light is dim and being missed.
+- `_SAT_MIN` and `_VAL_MIN` at the top of the file control the HSV thresholds used in the Stage 3 color classification fallback. Increase `_VAL_MIN` if background objects are picked up as lit; decrease it if the beacon light is dim and being missed.
+- The Stage 2 confidence threshold is hardcoded at `0.3` in `isolate_and_classify()` — lower than the main detection threshold to prefer finding something rather than falling back to full-crop HSV.
+- To flag a potentially-off blue beacon in consuming code, check `color == "blue" and intensity < 0.4`.
 
 ---
 

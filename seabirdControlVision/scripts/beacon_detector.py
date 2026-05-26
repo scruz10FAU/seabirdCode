@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-beacon_detector.py — Detects a single beacon class with one_beacon.pt,
-then isolates the light area inside the bounding box and classifies its color
-using HSV thresholding on the brightest pixels.
+beacon_detector.py — Two-stage beacon detection and color identification.
+
+Stage 1 — Beacon detection (one_beacon.pt):
+  Locates the beacon in the full frame and returns a bounding box.
+
+Stage 2 — Lit-area isolation (best_crop.pt):
+  The beacon bounding box is cropped and passed to a second model that
+  isolates the glowing/lit portion of the beacon. Supports both detection
+  (bbox output) and segmentation (mask output) model types. Falls back to
+  HSV brightness thresholding if the crop model finds nothing.
+
+Stage 3 — Color classification:
+  Runs classify_beacon_color() on only the isolated lit region.
+  1. Convert the lit crop to HSV.
+  2. Mask pixels with high Value (≥ 160) and moderate Saturation (≥ 60).
+  3. Compute the circular mean hue (handles red wrap-around at 0°/180°).
+  4. Map the hue to: red, orange, yellow, green, cyan, blue, magenta, white, or unknown.
 
 Usage:
-    python3 beacon_detector.py
-    python3 beacon_detector.py -m models/one_beacon.pt -d
-    python3 beacon_detector.py -td 0.5
-
-Color classification pipeline (post-detection):
-  1. Crop the detected bounding box from the BGR frame.
-  2. Convert crop to HSV.
-  3. Mask pixels with high Value (bright / lit) and moderate Saturation.
-  4. Compute the circular mean hue of those pixels.
-  5. Map hue angle to a color name: red, yellow, green, cyan, blue, magenta, or white.
+    python3 beacon_detector.py                          # ROS live mode
+    python3 beacon_detector.py -d                       # ROS live mode with display
+    python3 beacon_detector.py -rv footage.mp4          # video + ROS
+    python3 beacon_detector.py -v footage.mp4           # video only, no ROS
+    python3 beacon_detector.py -cm models/best_crop.pt  # custom crop model
 """
 
 import sys
@@ -23,8 +32,9 @@ import os
 sys.path.insert(0, os.path.expanduser("~/seabird/scripts"))
 
 import threading
+import csv
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Tuple
 import json
 import time
 import cv2
@@ -40,6 +50,7 @@ def _import_ros():
     global Image, CameraInfo, PoseStamped, GeoPointStamped, String, message_filters
     global CameraInterface, CameraConfig, Detection, Intrinsics
     global IMG_W, IMG_H, FX, FY, CX, CY, camera_to_world, YoloDetector
+    global BeaconCamera
     import rclpy as _rclpy; rclpy = _rclpy
     from rclpy.node import Node as _Node; Node = _Node
     from rclpy.qos import (QoSProfile as _QP, ReliabilityPolicy as _RP,
@@ -57,23 +68,231 @@ def _import_ros():
     IMG_W, IMG_H, FX, FY, CX, CY, camera_to_world = _W, _H, _FX, _FY, _CX, _CY, _c2w
     from yolo_detector import YoloDetector as _YD; YoloDetector = _YD
 
+    class BeaconCamera(Node):
+        """
+        Subscribes to ZED camera topics and runs beacon detection + color classification.
+
+        Publishes:
+            /seabird/beacon_detections  — JSON with label "beacon", detected color, position
+        """
+
+        def __init__(self, topic_prefix=DEFAULT_TOPIC_PREFIX):
+            super().__init__("beacon_camera")
+            self._topic_prefix = topic_prefix
+
+            self._rgb        = None
+            self._depth      = None
+            self._intrinsics = None
+            self._new_frame  = False
+            self._frame_lock = threading.Lock()
+
+            self._drone_pos       = None
+            self._drone_quat_wxyz = None
+            self._pose_lock       = threading.Lock()
+
+            self._gps_origin      = None
+            self._gps_origin_lock = threading.Lock()
+
+            self._is_open   = False
+            self._detector  = None
+            self.detection_pub = None
+
+        # ── Lifecycle ──────────────────────────────────────────────────────────
+
+        def open(self):
+            if self._is_open:
+                return True
+
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+
+            self._info_sub = self.create_subscription(
+                CameraInfo,
+                f"{self._topic_prefix}/rgb/color/rect/camera_info",
+                self._on_camera_info,
+                qos,
+            )
+
+            rgb_sub   = message_filters.Subscriber(
+                self, Image, f"{self._topic_prefix}/rgb/color/rect/image", qos_profile=qos
+            )
+            depth_sub = message_filters.Subscriber(
+                self, Image, f"{self._topic_prefix}/depth/depth_registered", qos_profile=qos
+            )
+            self._sync = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub], queue_size=5, slop=0.05
+            )
+            self._sync.registerCallback(self._on_synced_frame)
+
+            self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
+
+            self._pose_sub = self.create_subscription(
+                PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
+            )
+
+            origin_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self._origin_sub = self.create_subscription(
+                GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
+            )
+
+            self._is_open = True
+            self.get_logger().info("BeaconCamera open — waiting for frames…")
+            return True
+
+        def open_for_video(self):
+            """
+            Minimal ROS setup for video-file input mode.
+            Creates the detection publisher and subscribes to drone pose + GPS,
+            but skips all camera image subscriptions (frames come from cv2.VideoCapture).
+            """
+            if self._is_open:
+                return True
+
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+
+            self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
+
+            self._pose_sub = self.create_subscription(
+                PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
+            )
+
+            origin_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self._origin_sub = self.create_subscription(
+                GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
+            )
+
+            self._is_open = True
+            self.get_logger().info("BeaconCamera open (video-file mode) — pose + GPS only")
+            return True
+
+        def close(self):
+            self._is_open = False
+
+        def grab(self):
+            if not self._is_open:
+                return False
+            rclpy.spin_once(self, timeout_sec=0.05)
+            with self._frame_lock:
+                if self._new_frame:
+                    self._new_frame = False
+                    return True
+            return False
+
+        def enable_detection(self, model_path):
+            self._detector = YoloDetector(
+                weights=model_path,
+                class_names=["beacon"],
+                imgsz=320,
+                conf_thresh=0.5,
+            )
+            ok = self._detector.start(enable_tracking=True)
+            if not ok:
+                self._detector = None
+                self.get_logger().error("YoloDetector failed to start")
+            return ok
+
+        def get_rgb(self):
+            with self._frame_lock:
+                return self._rgb.copy() if self._rgb is not None else None
+
+        def get_depth(self):
+            with self._frame_lock:
+                return self._depth.copy() if self._depth is not None else None
+
+        def get_drone_pose(self):
+            with self._pose_lock:
+                if self._drone_pos is None:
+                    return None, None
+                return self._drone_pos.copy(), self._drone_quat_wxyz.copy()
+
+        def get_gps_origin(self):
+            with self._gps_origin_lock:
+                return self._gps_origin
+
+        def get_detections(self):
+            if self._detector is None:
+                return []
+            with self._frame_lock:
+                rgb   = self._rgb.copy()   if self._rgb   is not None else None
+                depth = self._depth.copy() if self._depth is not None else None
+            if rgb is None:
+                return []
+            return self._detector.detect(rgb, depth, self._intrinsics)
+
+        # ── ROS2 Callbacks ──────────────────────────────────────────────────────
+
+        def _on_camera_info(self, _msg):
+            if self._intrinsics is not None:
+                return
+            self._intrinsics = Intrinsics(
+                fx=FX, fy=FY, cx=CX, cy=CY, width=IMG_W, height=IMG_H
+            )
+            self.get_logger().info(
+                f"Intrinsics set from config: fx={FX:.1f} fy={FY:.1f} "
+                f"cx={CX:.1f} cy={CY:.1f} {IMG_W}x{IMG_H}"
+            )
+            self.destroy_subscription(self._info_sub)
+
+        def _on_synced_frame(self, rgb_msg, depth_msg):
+            channels = len(rgb_msg.data) // (rgb_msg.height * rgb_msg.width)
+            rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
+                rgb_msg.height, rgb_msg.width, channels
+            )
+            bgr   = rgb[:, :, :3][:, :, ::-1].copy()
+            depth = np.frombuffer(depth_msg.data, dtype=np.float32).reshape(
+                depth_msg.height, depth_msg.width
+            ).copy()
+            with self._frame_lock:
+                self._rgb       = bgr
+                self._depth     = depth
+                self._new_frame = True
+
+        def _on_drone_pose(self, msg):
+            p, q = msg.pose.position, msg.pose.orientation
+            with self._pose_lock:
+                self._drone_pos       = np.array([p.x, p.y, p.z])
+                self._drone_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
+
+        def _on_gps_origin(self, msg):
+            with self._gps_origin_lock:
+                self._gps_origin = (
+                    msg.position.latitude,
+                    msg.position.longitude,
+                    msg.position.altitude,
+                )
+            self.get_logger().info(
+                f"GPS origin: lat={msg.position.latitude:.7f} "
+                f"lon={msg.position.longitude:.7f}"
+            )
+
 # ── Color classification ───────────────────────────────────────────────────────
 
 # HSV saturation/value thresholds for "bright, lit" pixels
 _SAT_MIN = 60    # ignore nearly-grey pixels
 _VAL_MIN = 160   # only consider bright pixels (the light itself)
 
-# Hue boundary table (degrees, 0-180 in OpenCV).
+# Hue bands for the four supported beacon colors (degrees, 0-180 in OpenCV).
 # Each entry: (hue_center, half_width, label)
 _HUE_BANDS = [
-    (  0, 10, "red"),
-    ( 15, 12, "orange"),
-    ( 30, 15, "yellow"),
-    ( 60, 20, "green"),
-    ( 90, 15, "cyan"),
-    (105, 20, "blue"),
-    (135, 15, "magenta"),
-    (165, 15, "red"),   # wraps back to red
+    (  0, 15, "red"),    # 0–15
+    ( 60, 25, "green"),  # 35–85
+    (115, 20, "blue"),   # 95–135  ← blue is hardest to see in daylight; check intensity
+    (165, 15, "red"),    # 150–180 (wrap-around)
 ]
 
 
@@ -88,16 +307,19 @@ def _circular_mean_hue(hues: np.ndarray) -> float:
     return float(mean_angle * 180.0 / (2 * np.pi))   # back to 0-180
 
 
-def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray]:
+def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray, float]:
     """
     Given a BGR crop of a beacon bounding box, return:
-        (color_name, confidence, light_mask)
+        (color_name, color_confidence, light_mask, intensity)
 
-    confidence: fraction of crop pixels that are "lit" (higher = cleaner read).
-    light_mask: uint8 mask of the bright pixels used (same H×W as crop).
+    color_confidence: fraction of crop pixels that are "lit" (higher = cleaner read).
+    light_mask:       uint8 mask of the bright pixels used (same H×W as crop).
+    intensity:        mean brightness (Value channel) of lit pixels, 0.0–1.0.
+                      Low intensity on a "blue" result may indicate the beacon is off
+                      or too dim to read reliably in daylight.
     """
     if bgr_crop is None or bgr_crop.size == 0:
-        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8)
+        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0
 
     hsv = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -105,22 +327,26 @@ def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray]
     # Bright, saturated pixels → the light source
     light_mask = ((s >= _SAT_MIN) & (v >= _VAL_MIN)).astype(np.uint8) * 255
 
-    lit_pixels = np.count_nonzero(light_mask)
+    lit_pixels   = np.count_nonzero(light_mask)
     total_pixels = bgr_crop.shape[0] * bgr_crop.shape[1]
-    confidence = lit_pixels / max(total_pixels, 1)
+    color_conf   = lit_pixels / max(total_pixels, 1)
 
     if lit_pixels < 5:
-        # Fallback: not enough saturated pixels — check if it's very bright white
+        # Not enough saturated pixels — check for white (high V, low S)
         very_bright = (v >= 220)
-        if np.count_nonzero(very_bright) > total_pixels * 0.1:
-            return "white", float(np.count_nonzero(very_bright) / total_pixels), light_mask
-        return "unknown", 0.0, light_mask
+        bright_count = int(np.count_nonzero(very_bright))
+        if bright_count > total_pixels * 0.1:
+            intensity = float(np.mean(v[very_bright]) / 255.0)
+            return "white", float(bright_count / total_pixels), light_mask, intensity
+        return "unknown", 0.0, light_mask, 0.0
 
-    hues = h[light_mask > 0]
-    mean_hue = _circular_mean_hue(hues)
+    hues      = h[light_mask > 0]
+    mean_hue  = _circular_mean_hue(hues)
+    intensity = float(np.mean(v[light_mask > 0]) / 255.0)
 
-    # Map mean hue to the closest band
-    best_label = "unknown"
+    # Map mean hue to the closest of: red, green, blue.
+    # If nothing is within half_width, fall back to white (bright but unsaturated).
+    best_label = "white"
     best_dist  = 180.0
     for center, half, label in _HUE_BANDS:
         dist = abs(mean_hue - center)
@@ -129,10 +355,105 @@ def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray]
             best_dist  = dist
             best_label = label
 
-    return best_label, confidence, light_mask
+    # If the closest hue band is still outside its half-width, treat as white
+    if best_dist > max(half for _, half, _ in _HUE_BANDS):
+        best_label = "white"
+
+    return best_label, color_conf, light_mask, intensity
 
 
-# ── ROS2 Camera Node ───────────────────────────────────────────────────────────
+def isolate_and_classify(beacon_crop: np.ndarray, crop_model,
+                         conf: float = 0.3) -> Tuple[str, float, np.ndarray, float]:
+    """
+    Run best_crop.pt on a beacon bounding-box crop to find the lit area,
+    then classify its color.
+
+    Works with both detection models (returns a bbox) and segmentation
+    models (returns a pixel mask). Falls back to classify_beacon_color on
+    the full crop if the model finds nothing.
+
+    Returns: (color_name, color_confidence, display_mask, intensity)
+        display_mask — uint8 mask the same H×W as beacon_crop;
+                       255 where the lit area is, 0 elsewhere.
+        intensity    — mean brightness (Value) of lit pixels, 0.0–1.0.
+                       Low intensity on a "blue" result suggests the beacon
+                       may be off or too dim to classify reliably in daylight.
+    """
+    if beacon_crop is None or beacon_crop.size == 0:
+        return "unknown", 0.0, np.zeros((1, 1), dtype=np.uint8), 0.0
+
+    h, w = beacon_crop.shape[:2]
+    display_mask = np.zeros((h, w), dtype=np.uint8)
+
+    results = crop_model(beacon_crop.copy(), conf=conf, verbose=False)
+    boxes   = results[0].boxes
+
+    if len(boxes) == 0:
+        return classify_beacon_color(beacon_crop)
+
+    if results[0].masks is not None:
+        # Segmentation output — use the mask of the top-confidence detection
+        best_idx = int(np.argmax([float(b.conf[0]) for b in boxes]))
+        seg_mask = results[0].masks.data[best_idx].cpu().numpy()
+        seg_resized = cv2.resize(seg_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        display_mask = (seg_resized > 0.5).astype(np.uint8) * 255
+    else:
+        # Detection output — fill the bbox of the top-confidence detection
+        best_box = max(boxes, key=lambda b: float(b.conf[0]))
+        lx1, ly1, lx2, ly2 = map(int, best_box.xyxy[0].tolist())
+        lx1 = max(0, lx1); ly1 = max(0, ly1)
+        lx2 = min(w, lx2); ly2 = min(h, ly2)
+        if lx2 > lx1 and ly2 > ly1:
+            display_mask[ly1:ly2, lx1:lx2] = 255
+
+    if not display_mask.any():
+        return classify_beacon_color(beacon_crop)
+
+    # Tight-crop to the bounding box of the lit mask, then classify color
+    rows = np.any(display_mask > 0, axis=1)
+    cols = np.any(display_mask > 0, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    lit_region = beacon_crop[rmin:rmax + 1, cmin:cmax + 1]
+
+    color, color_conf, _, intensity = classify_beacon_color(lit_region)
+    return color, color_conf, display_mask, intensity
+
+
+# ── Detection logger ──────────────────────────────────────────────────────────
+
+_LOG_HEADER = [
+    "timestamp", "frame", "color", "color_confidence", "intensity",
+    "det_confidence", "x1", "y1", "x2", "y2", "tracking_id",
+    "pos3d_x", "pos3d_y", "pos3d_z",
+]
+
+
+def _open_log(path: str):
+    """Open a CSV log file, write the header, and return (file_handle, csv_writer)."""
+    fh = open(path, "w", newline="")
+    writer = csv.writer(fh)
+    writer.writerow(_LOG_HEADER)
+    print(f"[beacon] Logging detections → {path}")
+    return fh, writer
+
+
+def _write_log_row(log_writer, frame_idx: int, color: str,
+                   color_conf: float, intensity: float, det_conf: float,
+                   bbox, tracking_id: int = -1, pos3d=None) -> None:
+    x1, y1, x2, y2 = bbox
+    px = py = pz = ""
+    if pos3d is not None:
+        px, py, pz = f"{pos3d[0]:.4f}", f"{pos3d[1]:.4f}", f"{pos3d[2]:.4f}"
+    log_writer.writerow([
+        f"{time.time():.3f}", frame_idx,
+        color, f"{color_conf:.4f}", f"{intensity:.4f}", f"{det_conf:.4f}",
+        x1, y1, x2, y2, tracking_id,
+        px, py, pz,
+    ])
+
+
+# ── Helper (used by ROS modes) ────────────────────────────────────────────────
 
 def local_enu_to_gps(world_pos: np.ndarray,
                      origin_lat: float,
@@ -144,235 +465,19 @@ def local_enu_to_gps(world_pos: np.ndarray,
     return (origin_lat + dlat, origin_lon + dlon, origin_alt + up)
 
 
-class BeaconCamera(Node):
-    """
-    Subscribes to ZED camera topics and runs beacon detection + color classification.
-
-    Publishes:
-        /seabird/beacon_detections  — JSON with label "beacon", detected color, position
-    """
-
-    def __init__(self, topic_prefix: str = DEFAULT_TOPIC_PREFIX):
-        super().__init__("beacon_camera")
-        self._topic_prefix = topic_prefix
-
-        self._rgb:        Optional[np.ndarray] = None
-        self._depth:      Optional[np.ndarray] = None
-        self._intrinsics: Optional[Intrinsics]  = None
-        self._new_frame:  bool = False
-        self._frame_lock  = threading.Lock()
-
-        self._drone_pos:       Optional[np.ndarray] = None
-        self._drone_quat_wxyz: Optional[np.ndarray] = None
-        self._pose_lock        = threading.Lock()
-
-        self._gps_origin:      Optional[Tuple[float, float, float]] = None
-        self._gps_origin_lock  = threading.Lock()
-
-        self._is_open: bool = False
-        self._detector: Optional[YoloDetector] = None
-        self.detection_pub = None
-
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
-
-    def open(self) -> bool:
-        if self._is_open:
-            return True
-
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
-        self._info_sub = self.create_subscription(
-            CameraInfo,
-            f"{self._topic_prefix}/rgb/color/rect/camera_info",
-            self._on_camera_info,
-            qos,
-        )
-
-        rgb_sub   = message_filters.Subscriber(
-            self, Image, f"{self._topic_prefix}/rgb/color/rect/image", qos_profile=qos
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, f"{self._topic_prefix}/depth/depth_registered", qos_profile=qos
-        )
-        self._sync = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub], queue_size=5, slop=0.05
-        )
-        self._sync.registerCallback(self._on_synced_frame)
-
-        self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
-
-        self._pose_sub = self.create_subscription(
-            PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
-        )
-
-        origin_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            depth=1,
-        )
-        self._origin_sub = self.create_subscription(
-            GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
-        )
-
-        self._is_open = True
-        self.get_logger().info("BeaconCamera open — waiting for frames…")
-        return True
-
-    def open_for_video(self) -> bool:
-        """
-        Minimal ROS setup for video-file input mode.
-        Creates the detection publisher and subscribes to drone pose + GPS,
-        but skips all camera image subscriptions (frames come from cv2.VideoCapture).
-        """
-        if self._is_open:
-            return True
-
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
-        self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
-
-        self._pose_sub = self.create_subscription(
-            PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
-        )
-
-        origin_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            depth=1,
-        )
-        self._origin_sub = self.create_subscription(
-            GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
-        )
-
-        self._is_open = True
-        self.get_logger().info("BeaconCamera open (video-file mode) — pose + GPS only")
-        return True
-
-    def close(self) -> None:
-        self._is_open = False
-
-    def grab(self) -> bool:
-        if not self._is_open:
-            return False
-        rclpy.spin_once(self, timeout_sec=0.05)
-        with self._frame_lock:
-            if self._new_frame:
-                self._new_frame = False
-                return True
-        return False
-
-    def enable_detection(self, model_path: str) -> bool:
-        self._detector = YoloDetector(
-            weights=model_path,
-            class_names=["beacon"],   # single class — no color in the model
-            imgsz=320,
-            conf_thresh=0.5,
-        )
-        ok = self._detector.start(enable_tracking=True)
-        if not ok:
-            self._detector = None
-            self.get_logger().error("YoloDetector failed to start")
-        return ok
-
-    def get_rgb(self)   -> Optional[np.ndarray]:
-        with self._frame_lock:
-            return self._rgb.copy() if self._rgb is not None else None
-
-    def get_depth(self) -> Optional[np.ndarray]:
-        with self._frame_lock:
-            return self._depth.copy() if self._depth is not None else None
-
-    def get_drone_pose(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        with self._pose_lock:
-            if self._drone_pos is None:
-                return None, None
-            return self._drone_pos.copy(), self._drone_quat_wxyz.copy()
-
-    def get_gps_origin(self) -> Optional[Tuple[float, float, float]]:
-        with self._gps_origin_lock:
-            return self._gps_origin
-
-    def get_detections(self) -> List[Detection]:
-        if self._detector is None:
-            return []
-        with self._frame_lock:
-            rgb   = self._rgb.copy()   if self._rgb   is not None else None
-            depth = self._depth.copy() if self._depth is not None else None
-        if rgb is None:
-            return []
-        return self._detector.detect(rgb, depth, self._intrinsics)
-
-    # ── ROS2 Callbacks ─────────────────────────────────────────────────────────
-
-    def _on_camera_info(self, msg: CameraInfo) -> None:
-        if self._intrinsics is not None:
-            return
-        self._intrinsics = Intrinsics(
-            fx=FX, fy=FY, cx=CX, cy=CY, width=IMG_W, height=IMG_H
-        )
-        self.get_logger().info(
-            f"Intrinsics set from config: fx={FX:.1f} fy={FY:.1f} "
-            f"cx={CX:.1f} cy={CY:.1f} {IMG_W}x{IMG_H}"
-        )
-        self.destroy_subscription(self._info_sub)
-
-    def _on_synced_frame(self, rgb_msg: Image, depth_msg: Image) -> None:
-        channels = len(rgb_msg.data) // (rgb_msg.height * rgb_msg.width)
-        rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
-            rgb_msg.height, rgb_msg.width, channels
-        )
-        bgr   = rgb[:, :, :3][:, :, ::-1].copy()
-        depth = np.frombuffer(depth_msg.data, dtype=np.float32).reshape(
-            depth_msg.height, depth_msg.width
-        ).copy()
-        with self._frame_lock:
-            self._rgb      = bgr
-            self._depth    = depth
-            self._new_frame = True
-
-    def _on_drone_pose(self, msg: PoseStamped) -> None:
-        p, q = msg.pose.position, msg.pose.orientation
-        with self._pose_lock:
-            self._drone_pos       = np.array([p.x, p.y, p.z])
-            self._drone_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
-
-    def _on_gps_origin(self, msg: GeoPointStamped) -> None:
-        with self._gps_origin_lock:
-            self._gps_origin = (
-                msg.position.latitude,
-                msg.position.longitude,
-                msg.position.altitude,
-            )
-        self.get_logger().info(
-            f"GPS origin: lat={msg.position.latitude:.7f} "
-            f"lon={msg.position.longitude:.7f}"
-        )
-
-
 # ── Video test mode (no ROS) ───────────────────────────────────────────────────
 
 _COLOR_BGR = {
     "red":     (0,   0,   255),
-    "orange":  (0,   128, 255),
-    "yellow":  (0,   255, 255),
-    "green":   (0,   255,   0),
-    "cyan":    (255, 255,   0),
-    "blue":    (255,   0,   0),
-    "magenta": (255,   0, 255),
+    "green":   (0,   200,   0),
+    "blue":    (255,  80,   0),
     "white":   (255, 255, 255),
     "unknown": (180, 180, 180),
 }
 
 
-def _annotate_frame(frame: np.ndarray, boxes, names: dict) -> np.ndarray:
+def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
+                    log_writer=None, frame_idx: int = 0) -> np.ndarray:
     """Draw detections + color classification on a single BGR frame."""
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -381,7 +486,7 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict) -> np.ndarray:
         label = names.get(cls, str(cls))
 
         crop = frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-        beacon_color, color_conf, light_mask = classify_beacon_color(crop)
+        beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
         draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
@@ -396,19 +501,25 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict) -> np.ndarray:
             tint[:] = draw_color
             frame[lm_full > 0] = cv2.addWeighted(frame, 0.5, tint, 0.5, 0)[lm_full > 0]
 
-        txt = f"{label} [{beacon_color}] det={conf:.2f} col={color_conf:.2f}"
+        txt = f"{label} [{beacon_color}] det={conf:.2f} col={color_conf:.2f} int={intensity:.2f}"
         cv2.putText(frame, txt, (x1, max(y1 - 6, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1)
 
         print(f"  {txt}  bbox=({x1},{y1},{x2},{y2})")
+
+        if log_writer is not None:
+            _write_log_row(log_writer, frame_idx, beacon_color, color_conf,
+                           intensity, conf, (x1, y1, x2, y2))
 
     return frame
 
 
 def run_video(video_path: str,
               model_path: str = "models/one_beacon.pt",
+              crop_model_path: str = "models/best_crop.pt",
               save_output: bool = False,
-              conf: float = 0.5) -> None:
+              conf: float = 0.5,
+              log: bool = False) -> None:
     """
     Run beacon detection + color classification on a local video file.
     No ROS required — uses ultralytics.YOLO directly.
@@ -425,18 +536,24 @@ def run_video(video_path: str,
         print(f"[beacon-video] Model not found: {model_path}")
         return
 
+    if not os.path.exists(crop_model_path):
+        print(f"[beacon-video] Crop model not found: {crop_model_path}")
+        return
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[beacon-video] Cannot open video: {video_path}")
         return
 
-    model  = YOLO(model_path)
+    model       = YOLO(model_path)
+    crop_model  = YOLO(crop_model_path)
     fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"[beacon-video] {video_path}  {width}x{height} @ {fps:.1f}fps  {total} frames")
-    print(f"[beacon-video] Model: {model_path}  conf≥{conf}")
+    print(f"[beacon-video] Beacon model : {model_path}  conf≥{conf}")
+    print(f"[beacon-video] Crop model   : {crop_model_path}")
     print("[beacon-video] Press 'q' to quit, SPACE to pause")
 
     writer = None
@@ -446,30 +563,42 @@ def run_video(video_path: str,
         writer   = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
         print(f"[beacon-video] Saving output → {out_path}")
 
-    frame_idx = 0
-    paused    = False
+    log_fh = log_writer = None
+    if log:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.splitext(video_path)[0] + f"_beacon_log_{ts}.csv"
+        log_fh, log_writer = _open_log(log_path)
+
+    frame_idx     = 0
+    paused        = False
+    display_frame = None
+
+    cv2.namedWindow("Beacon Detector — Video Test", cv2.WINDOW_AUTOSIZE)
 
     try:
         while True:
             if not paused:
-                ret, frame = cap.read()
+                ret, raw = cap.read()
                 if not ret:
                     print("[beacon-video] End of video")
                     break
                 frame_idx += 1
 
-                results = model(frame, conf=conf, verbose=False)
+                display_frame = raw.copy()           # safe copy — YOLO never touches this
+                results = model(raw, conf=conf, verbose=False)
                 boxes   = results[0].boxes
                 names   = results[0].names
 
                 print(f"Frame {frame_idx}/{total} — {len(boxes)} detection(s)")
-                frame = _annotate_frame(frame, boxes, names)
+                display_frame = _annotate_frame(display_frame, boxes, names, crop_model,
+                                                log_writer=log_writer, frame_idx=frame_idx)
 
                 if writer:
-                    writer.write(frame)
+                    writer.write(display_frame)
 
-            cv2.imshow("Beacon Detector — Video Test", frame)
-            key = cv2.waitKey(1 if not paused else 50) & 0xFF
+            if display_frame is not None:
+                cv2.imshow("Beacon Detector — Video Test", display_frame)
+            key = cv2.waitKey(10 if not paused else 50) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord(" "):
@@ -481,6 +610,8 @@ def run_video(video_path: str,
         cap.release()
         if writer:
             writer.release()
+        if log_fh:
+            log_fh.close()
         cv2.destroyAllWindows()
         print(f"[beacon-video] Done — {frame_idx} frames processed")
 
@@ -489,8 +620,10 @@ def run_video(video_path: str,
 
 def run_video_ros(video_path: str,
                   model_path: str = "models/one_beacon.pt",
+                  crop_model_path: str = "models/best_crop.pt",
                   save_output: bool = False,
-                  conf: float = 0.5) -> None:
+                  conf: float = 0.5,
+                  log: bool = False) -> None:
     """
     Read frames from a local video file, publish detections to ROS, and show
     a live display window.
@@ -515,6 +648,10 @@ def run_video_ros(video_path: str,
         print(f"[beacon-ros-video] Model not found: {model_path}")
         return
 
+    if not os.path.exists(crop_model_path):
+        print(f"[beacon-ros-video] Crop model not found: {crop_model_path}")
+        return
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[beacon-ros-video] Cannot open video: {video_path}")
@@ -536,9 +673,18 @@ def run_video_ros(video_path: str,
         writer   = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
         print(f"[beacon-ros-video] Saving output → {out_path}")
 
+    log_fh = log_writer = None
+    if log:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.splitext(video_path)[0] + f"_beacon_log_{ts}.csv"
+        log_fh, log_writer = _open_log(log_path)
+
     rclpy.init()
-    cam   = BeaconCamera()
-    model = YOLO(model_path)
+    cam        = BeaconCamera()
+    model      = YOLO(model_path)
+    crop_model = YOLO(crop_model_path)
+    print(f"[beacon-ros-video] Beacon model : {model_path}  conf≥{conf}")
+    print(f"[beacon-ros-video] Crop model   : {crop_model_path}")
 
     if not cam.open_for_video():
         print("[beacon-ros-video] Failed to open ROS node")
@@ -546,8 +692,11 @@ def run_video_ros(video_path: str,
         cap.release()
         return
 
-    frame_idx = 0
-    paused    = False
+    frame_idx     = 0
+    paused        = False
+    display_frame = None
+
+    cv2.namedWindow("Beacon Detector — Video + ROS", cv2.WINDOW_AUTOSIZE)
 
     try:
         while rclpy.ok():
@@ -555,15 +704,16 @@ def run_video_ros(video_path: str,
             rclpy.spin_once(cam, timeout_sec=0.0)
 
             if not paused:
-                ret, frame = cap.read()
+                ret, raw = cap.read()
                 if not ret:
                     print("[beacon-ros-video] End of video")
                     break
                 frame_idx += 1
 
                 drone_pos, _ = cam.get_drone_pose()
+                display_frame = raw.copy()           # safe copy — YOLO never touches this
 
-                results = model(frame, conf=conf, verbose=False)
+                results = model(raw, conf=conf, verbose=False)
                 boxes   = results[0].boxes
 
                 print(f"Frame {frame_idx}/{total} — {len(boxes)} detection(s)")
@@ -572,28 +722,28 @@ def run_video_ros(video_path: str,
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                     det_conf = float(box.conf[0])
 
-                    crop = frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-                    beacon_color, color_conf, light_mask = classify_beacon_color(crop)
+                    crop = display_frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
+                    beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
                     draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), draw_color, 2)
 
                     if light_mask is not None and light_mask.any():
-                        lm_full = np.zeros(frame.shape[:2], dtype=np.uint8)
+                        lm_full = np.zeros(display_frame.shape[:2], dtype=np.uint8)
                         lm_h = min(light_mask.shape[0], y2 - y1)
                         lm_w = min(light_mask.shape[1], x2 - x1)
                         lm_full[y1:y1+lm_h, x1:x1+lm_w] = light_mask[:lm_h, :lm_w]
-                        tint = np.zeros_like(frame)
+                        tint = np.zeros_like(display_frame)
                         tint[:] = draw_color
-                        frame[lm_full > 0] = cv2.addWeighted(
-                            frame, 0.5, tint, 0.5, 0
+                        display_frame[lm_full > 0] = cv2.addWeighted(
+                            display_frame, 0.5, tint, 0.5, 0
                         )[lm_full > 0]
 
                     label_txt = (
                         f"beacon [{beacon_color}] "
-                        f"det={det_conf:.2f} col={color_conf:.2f}"
+                        f"det={det_conf:.2f} col={color_conf:.2f} int={intensity:.2f}"
                     )
-                    cv2.putText(frame, label_txt, (x1, max(y1 - 6, 10)),
+                    cv2.putText(display_frame, label_txt, (x1, max(y1 - 6, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1)
 
                     # Publish to ROS
@@ -602,6 +752,7 @@ def run_video_ros(video_path: str,
                         "label":            "beacon",
                         "color":            beacon_color,
                         "color_confidence": color_conf,
+                        "intensity":        intensity,
                         "confidence":       det_conf,
                         "bbox":             [x1, y1, x2, y2],
                         "position_3d":      None,
@@ -614,11 +765,16 @@ def run_video_ros(video_path: str,
                     cam.detection_pub.publish(msg)
                     print(f"  {label_txt}")
 
-                if writer:
-                    writer.write(frame)
+                    if log_writer is not None:
+                        _write_log_row(log_writer, frame_idx, beacon_color, color_conf,
+                                       intensity, det_conf, (x1, y1, x2, y2))
 
-            cv2.imshow("Beacon Detector — Video + ROS", frame)
-            key = cv2.waitKey(1 if not paused else 50) & 0xFF
+                if writer:
+                    writer.write(display_frame)
+
+            if display_frame is not None:
+                cv2.imshow("Beacon Detector — Video + ROS", display_frame)
+            key = cv2.waitKey(10 if not paused else 50) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord(" "):
@@ -630,6 +786,8 @@ def run_video_ros(video_path: str,
         cap.release()
         if writer:
             writer.release()
+        if log_fh:
+            log_fh.close()
         cam.close()
         cv2.destroyAllWindows()
         rclpy.shutdown()
@@ -640,7 +798,9 @@ def run_video_ros(video_path: str,
 
 def main(model: str = "models/one_beacon.pt",
          display: bool = False,
-         true_distance: float = 0.4826) -> None:
+         true_distance: float = 0.4826,
+         crop_model_path: str = "models/best_crop.pt",
+         log: bool = False) -> None:
 
     _import_ros()   # pull in ROS2 / camera_interface / seabird_config
 
@@ -662,7 +822,16 @@ def main(model: str = "models/one_beacon.pt",
         rclpy.shutdown()
         return
 
+    if not os.path.exists(crop_model_path):
+        print(f"[beacon] Crop model not found: {crop_model_path}")
+        cam.close()
+        rclpy.shutdown()
+        return
+
+    from ultralytics import YOLO
     print(f"[beacon] Loading model: {model}")
+    print(f"[beacon] Loading crop model: {crop_model_path}")
+    crop_model = YOLO(crop_model_path)
     if not cam.enable_detection(model):
         print("[beacon] Detection failed to start")
         cam.close()
@@ -671,6 +840,15 @@ def main(model: str = "models/one_beacon.pt",
 
     print("[beacon] Detection ENABLED — class: beacon (color determined by CV)")
     print("[beacon] Publishing → /seabird/beacon_detections")
+
+    if display:
+        cv2.namedWindow("Beacon Detector", cv2.WINDOW_AUTOSIZE)
+
+    log_fh = log_writer = None
+    if log:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(DEBUG_DIR, f"beacon_log_{ts}.csv")
+        log_fh, log_writer = _open_log(log_path)
 
     frame_count       = 0
     intrinsics_printed = False
@@ -701,7 +879,7 @@ def main(model: str = "models/one_beacon.pt",
 
                 # ── Color determination from the beacon's light area ──────────
                 crop = rgb[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
-                beacon_color, color_conf, light_mask = classify_beacon_color(crop)
+                beacon_color, color_conf, light_mask, intensity = isolate_and_classify(crop, crop_model)
                 # ─────────────────────────────────────────────────────────────
 
                 draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
@@ -723,7 +901,7 @@ def main(model: str = "models/one_beacon.pt",
                 label_txt = (
                     f"beacon [{beacon_color}] "
                     f"conf={d.confidence:.2f} "
-                    f"col_conf={color_conf:.2f}"
+                    f"col={color_conf:.2f} int={intensity:.2f}"
                 )
                 if d.tracking_id >= 0:
                     label_txt += f" #{d.tracking_id}"
@@ -751,10 +929,11 @@ def main(model: str = "models/one_beacon.pt",
                 # ── Publish ──────────────────────────────────────────────────
                 msg = String()
                 msg.data = json.dumps({
-                    "label":          "beacon",
-                    "color":          beacon_color,
+                    "label":            "beacon",
+                    "color":            beacon_color,
                     "color_confidence": color_conf,
-                    "confidence":     float(d.confidence),
+                    "intensity":        intensity,
+                    "confidence":       float(d.confidence),
                     "bbox":           list(d.bbox_2d),
                     "position_3d":    d.position_3d.tolist() if d.position_3d is not None else None,
                     "world_position": world_pos.tolist()     if world_pos     is not None else None,
@@ -765,13 +944,19 @@ def main(model: str = "models/one_beacon.pt",
                 })
                 cam.detection_pub.publish(msg)
 
+                if log_writer is not None:
+                    _write_log_row(log_writer, frame_count, beacon_color, color_conf,
+                                   intensity, float(d.confidence), d.bbox_2d,
+                                   tracking_id=d.tracking_id,
+                                   pos3d=d.position_3d)
+
                 print(f"[beacon] {label_txt}"
                       + (f" pos3d=({d.position_3d[2]:.2f}m)" if d.position_3d is not None else ""))
 
             # ── Display ───────────────────────────────────────────────────────
             if display and rgb is not None:
                 cv2.imshow("Beacon Detector", rgb)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(10) & 0xFF == ord("q"):
                     break
 
             # ── Periodic save ─────────────────────────────────────────────────
@@ -783,6 +968,8 @@ def main(model: str = "models/one_beacon.pt",
     except KeyboardInterrupt:
         print("\n[beacon] Interrupted")
     finally:
+        if log_fh:
+            log_fh.close()
         cam.close()
         cv2.destroyAllWindows()
         rclpy.shutdown()
@@ -832,11 +1019,26 @@ if __name__ == "__main__":
         default=0.5,
         help="Detection confidence threshold (video modes, default 0.5)",
     )
+    parser.add_argument(
+        "--crop-model", "-cm",
+        default="models/best_crop.pt",
+        type=str,
+        metavar="CROP_MODEL_PATH",
+        help="Path to YOLO lit-area isolation model (default: models/best_crop.pt)",
+    )
+    parser.add_argument(
+        "--log", "-l",
+        action="store_true",
+        help="Save a CSV detection log (color, intensity, confidence, bbox) for each run",
+    )
     args = parser.parse_args()
 
     if args.ros_video is not None:
-        run_video_ros(args.ros_video, model_path=args.model, save_output=args.save, conf=args.conf)
+        run_video_ros(args.ros_video, model_path=args.model, crop_model_path=args.crop_model,
+                      save_output=args.save, conf=args.conf, log=args.log)
     elif args.video is not None:
-        run_video(args.video, model_path=args.model, save_output=args.save, conf=args.conf)
+        run_video(args.video, model_path=args.model, crop_model_path=args.crop_model,
+                  save_output=args.save, conf=args.conf, log=args.log)
     else:
-        main(args.model, args.display, args.true_dist)
+        main(args.model, args.display, args.true_dist, crop_model_path=args.crop_model,
+             log=args.log)
