@@ -289,13 +289,20 @@ _VAL_MIN = 160   # only consider bright pixels (the light itself)
 # Hue bands for the four supported beacon colors (degrees, 0-180 in OpenCV).
 # Each entry: (hue_center, half_width, label)
 # Bands use STRICT membership — a hue must fall within center±half_width to match.
-# Gaps between bands intentionally fall through to "unknown" rather than mis-snap.
+# Gaps between bands intentionally fall through to "other" rather than mis-snap.
 _HUE_BANDS = [
-    (  0, 15, "red"),    # 0–15
-    ( 65, 30, "green"),  # 35–95  (wide to cover teal-ish LEDs)
-    (120, 15, "blue"),   # 105–135 (gap at 95–105 prevents green→blue mis-snap)
+    (  0, 20, "red"),    # 0–20  (widened to capture orange-red LEDs at hue 15–20)
+    ( 65, 30, "green"),  # 35–95 (wide to cover teal-ish LEDs)
+    (120, 15, "blue"),   # 105–135
     (165, 15, "red"),    # 150–180 (wrap-around)
 ]
+
+# Minimum red-pixel fraction to declare "red", even when blue pixels outnumber red.
+# When a red LED is on, vote_red is always ≥0.33 in practice.
+# When the beacon is off (housing appears blue), vote_red is ≈0.
+# Setting this to 0.25 catches dim/transitioning red LEDs without false-triggering on
+# the off state.
+_RED_THRESHOLD = 0.25
 
 
 def _hue_votes(hues: np.ndarray) -> dict:
@@ -303,21 +310,24 @@ def _hue_votes(hues: np.ndarray) -> dict:
     For each lit pixel, check which hue band it belongs to (strict membership).
     Returns fraction of lit pixels in each color: {"red", "green", "blue", "other"}.
     "other" = pixels whose hue does not fall in any defined band (gaps/ambiguous).
+    Uses numpy vectorized ops — no Python pixel loop.
     """
     n = max(len(hues), 1)
-    counts = {"red": 0, "green": 0, "blue": 0, "other": 0}
-    for hue in hues:
-        matched = False
-        for center, half, label in _HUE_BANDS:
-            dist = abs(int(hue) - center)
-            dist = min(dist, 180 - dist)
-            if dist <= half:
-                counts[label] += 1
-                matched = True
-                break
-        if not matched:
-            counts["other"] += 1
-    return {k: counts[k] / n for k in counts}
+    hues_f = hues.astype(np.float32)
+    matched = np.zeros(len(hues), dtype=bool)
+    label_counts: dict = {}
+
+    for center, half, label in _HUE_BANDS:
+        dist = np.abs(hues_f - center)
+        dist = np.minimum(dist, 180.0 - dist)
+        in_band = (dist <= half) & ~matched
+        label_counts[label] = label_counts.get(label, 0) + int(np.sum(in_band))
+        matched |= in_band
+
+    result = {"red": 0, "green": 0, "blue": 0, "other": int(np.sum(~matched))}
+    for label, count in label_counts.items():
+        result[label] = result.get(label, 0) + count
+    return {k: result[k] / n for k in result}
 
 
 def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray, float, dict]:
@@ -361,12 +371,16 @@ def classify_beacon_color(bgr_crop: np.ndarray) -> Tuple[str, float, np.ndarray,
     intensity = float(np.mean(v[light_mask > 0]) / 255.0)
 
     # Per-pixel hue vote — majority of lit pixels determines the color.
-    # More robust than a single mean hue: outlier pixels don't skew the result.
     votes = _hue_votes(hues)
-    winner = max(("red", "green", "blue"), key=lambda c: votes[c])
 
-    # Require the winner to hold at least 30% of lit pixels to avoid noise wins
-    color = winner if votes[winner] >= 0.30 else "unknown"
+    # Red gets priority: if enough red pixels are present, call it red even if
+    # blue background pixels outnumber them slightly. When the beacon is off the
+    # housing reads vote_red≈0, so this never fires on a genuinely off beacon.
+    if votes["red"] >= _RED_THRESHOLD:
+        color = "red"
+    else:
+        winner = max(("green", "blue"), key=lambda c: votes[c])
+        color = winner if votes[winner] >= 0.30 else "unknown"
 
     return color, color_conf, light_mask, intensity, votes
 
