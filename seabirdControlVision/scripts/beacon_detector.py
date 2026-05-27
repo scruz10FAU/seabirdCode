@@ -38,6 +38,7 @@ from typing import Tuple
 import json
 import time
 import cv2
+from collections import deque, Counter
 
 DEFAULT_TOPIC_PREFIX = "/zed/zed_node"
 DRONE_POSE_TOPIC     = "/mavros/local_position/pose"
@@ -302,7 +303,14 @@ _HUE_BANDS = [
 # When the beacon is off (housing appears blue), vote_red is ≈0.
 # Setting this to 0.25 catches dim/transitioning red LEDs without false-triggering on
 # the off state.
-_RED_THRESHOLD = 0.25
+_RED_THRESHOLD = 0.1
+
+_BLINK_WINDOW_SEC          = 4.0   # rolling window length for blink estimation (seconds)
+_BLINK_MIN_DATA_SEC        = 2.0   # return "unknown" until this many seconds of samples are in the window
+_BLINK_INTENSITY_MIN_SWING = 0.05  # blue beacon: min peak-to-peak intensity swing to qualify as blinking
+_BLINK_HZ_RANGE            = (0.5, 2.0)  # valid blink frequency range — centered on 1 Hz target
+_BLINK_MIN_EDGES           = 3     # rising edges needed (= 2 complete periods in the window)
+_BLINK_MIN_EDGE_GAP        = 0.20  # debounce: ignore edges closer than this (filters threshold chatter)
 
 
 def _hue_votes(hues: np.ndarray) -> dict:
@@ -482,6 +490,114 @@ def _write_log_row(log_writer, frame_idx: int, color: str,
     ])
 
 
+# ── Blink detection ───────────────────────────────────────────────────────────
+
+class BlinkDetector:
+    """
+    Estimates blink frequency from a rolling window of (timestamp, color, intensity) samples.
+
+    Red/green beacons: rising edge = transition from "blue" (off) to signal color (on).
+    Blue beacon:       rising edge = intensity crossing _BLUE_ON_INTENSITY upward.
+    Returns a dict: {is_blinking, blink_color, blink_hz, phase}.
+    """
+
+    def __init__(self):
+        self._samples: deque = deque()  # (timestamp, color, intensity)
+
+    def update(self, ts: float, color: str, intensity: float) -> dict:
+        self._samples.append((ts, color, intensity))
+        cutoff = ts - _BLINK_WINDOW_SEC
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        return self._estimate()
+
+    def _estimate(self) -> dict:
+        if len(self._samples) < 4:
+            return {"is_blinking": None, "blink_color": "unknown", "blink_hz": None, "phase": "unknown"}
+
+        timestamps  = [s[0] for s in self._samples]
+        colors      = [s[1] for s in self._samples]
+        intensities = [s[2] for s in self._samples]
+
+        data_span = timestamps[-1] - timestamps[0]
+
+        # Not enough history yet — is_blinking=None signals "still deciding",
+        # distinct from False which means "confirmed not blinking".
+        if data_span < _BLINK_MIN_DATA_SEC:
+            return {"is_blinking": None, "blink_color": "unknown", "blink_hz": None, "phase": "unknown"}
+
+        # Determine signal type from dominant non-blue color in window
+        color_counts = Counter(c for c in colors if c not in ("blue", "unknown"))
+        if color_counts:
+            blink_color = color_counts.most_common(1)[0][0]
+            on_flags = [c == blink_color for c in colors]
+        else:
+            # All blue — detect oscillations relative to the window mean.
+            # Requires a minimum peak-to-peak swing so flat/steady signals don't
+            # generate spurious rising edges.
+            blink_color = "blue"
+            swing = max(intensities) - min(intensities)
+            if swing < _BLINK_INTENSITY_MIN_SWING:
+                phase = "on" if intensities[-1] >= (sum(intensities) / len(intensities)) else "off"
+                return {"is_blinking": False, "blink_color": "blue", "blink_hz": None, "phase": phase}
+            mean_intensity = sum(intensities) / len(intensities)
+            on_flags = [i >= mean_intensity for i in intensities]
+
+        phase = "on" if on_flags[-1] else "off"
+
+        # Rising edges (off→on), debounced to suppress threshold chatter.
+        # Frames near the mean crossing can flip rapidly, producing fake edges
+        # with sub-frame IOIs that would corrupt the frequency estimate.
+        raw_edges = [
+            timestamps[i]
+            for i in range(1, len(on_flags))
+            if not on_flags[i - 1] and on_flags[i]
+        ]
+        rising_edges: list = []
+        last_edge = -1.0
+        for t in raw_edges:
+            if t - last_edge >= _BLINK_MIN_EDGE_GAP:
+                rising_edges.append(t)
+                last_edge = t
+
+        # Need 3 rising edges = 2 complete periods in the window.
+        # If we don't have them yet, return null (still accumulating) unless the
+        # window is old enough that a 1 Hz beacon would definitely have produced them
+        # by now (3 s gives a 1 Hz beacon ~1 s of margin beyond the 2-edge minimum).
+        if len(rising_edges) < _BLINK_MIN_EDGES:
+            still_accumulating = data_span < (_BLINK_MIN_DATA_SEC + 1.0)
+            return {
+                "is_blinking": None if still_accumulating else False,
+                "blink_color": blink_color if not still_accumulating else "unknown",
+                "blink_hz": None,
+                "phase": phase if not still_accumulating else "unknown",
+            }
+
+        iois = [rising_edges[i + 1] - rising_edges[i] for i in range(len(rising_edges) - 1)]
+        mean_ioi = sum(iois) / len(iois)
+        if mean_ioi <= 0:
+            return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
+
+        hz = 1.0 / mean_ioi
+        lo, hi = _BLINK_HZ_RANGE
+        is_blinking = lo <= hz <= hi
+        return {
+            "is_blinking": is_blinking,
+            "blink_color": blink_color,
+            "blink_hz":    round(hz, 2) if is_blinking else None,
+            "phase":       phase,
+        }
+
+
+_blink_detectors: dict = {}
+
+
+def _get_blink_detector(tracking_id: int) -> BlinkDetector:
+    if tracking_id not in _blink_detectors:
+        _blink_detectors[tracking_id] = BlinkDetector()
+    return _blink_detectors[tracking_id]
+
+
 # ── Helper (used by ROS modes) ────────────────────────────────────────────────
 
 def local_enu_to_gps(world_pos: np.ndarray,
@@ -506,7 +622,8 @@ _COLOR_BGR = {
 
 
 def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
-                    log_writer=None, frame_idx: int = 0) -> np.ndarray:
+                    log_writer=None, frame_idx: int = 0,
+                    blink_detector: BlinkDetector = None) -> np.ndarray:
     """Draw detections + color classification on a single BGR frame."""
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -517,6 +634,10 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
         crop = frame[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
         beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
         draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
+
+        blink_info = None
+        if blink_detector is not None:
+            blink_info = blink_detector.update(time.time(), beacon_color, intensity)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
 
@@ -532,6 +653,11 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
 
         txt = (f"{label} [{beacon_color}] det={conf:.2f} int={intensity:.2f} "
                f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}")
+        if blink_info:
+            if blink_info["is_blinking"]:
+                txt += f" blink={blink_info['blink_hz']:.2f}Hz"
+            elif blink_info["is_blinking"] is None:
+                txt += " blink=?"
         cv2.putText(frame, txt, (x1, max(y1 - 6, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
 
@@ -599,6 +725,7 @@ def run_video(video_path: str,
         log_path = os.path.splitext(video_path)[0] + f"_beacon_log_{ts}.csv"
         log_fh, log_writer = _open_log(log_path)
 
+    blink_detector = BlinkDetector()
     frame_idx     = 0
     paused        = False
     display_frame = None
@@ -621,7 +748,8 @@ def run_video(video_path: str,
 
                 print(f"Frame {frame_idx}/{total} — {len(boxes)} detection(s)")
                 display_frame = _annotate_frame(display_frame, boxes, names, crop_model,
-                                                log_writer=log_writer, frame_idx=frame_idx)
+                                                log_writer=log_writer, frame_idx=frame_idx,
+                                                blink_detector=blink_detector)
 
                 if writer:
                     writer.write(display_frame)
@@ -709,6 +837,7 @@ def run_video_ros(video_path: str,
         log_path = os.path.splitext(video_path)[0] + f"_beacon_log_{ts}.csv"
         log_fh, log_writer = _open_log(log_path)
 
+    blink_detector = BlinkDetector()
     rclpy.init()
     cam        = BeaconCamera()
     model      = YOLO(model_path)
@@ -756,6 +885,8 @@ def run_video_ros(video_path: str,
                     beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
                     draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
+                    blink_info = blink_detector.update(time.time(), beacon_color, intensity)
+
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), draw_color, 2)
 
                     if light_mask is not None and light_mask.any():
@@ -773,14 +904,19 @@ def run_video_ros(video_path: str,
                         f"beacon [{beacon_color}] det={det_conf:.2f} int={intensity:.2f} "
                         f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}"
                     )
+                    if blink_info["is_blinking"]:
+                        label_txt += f" blink={blink_info['blink_hz']:.2f}Hz"
+                    elif blink_info["is_blinking"] is None:
+                        label_txt += " blink=?"
                     cv2.putText(display_frame, label_txt, (x1, max(y1 - 6, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
 
                     # Publish to ROS
                     msg = String()
                     msg.data = json.dumps({
-                        "label":            "beacon",
                         "color":            beacon_color,
+                        "blink":            blink_info,
+                        "label":            "beacon",
                         "color_confidence": color_conf,
                         "intensity":        intensity,
                         "hue_votes":        votes,
@@ -911,6 +1047,9 @@ def main(model: str = "models/one_beacon.pt",
                 # ── Color determination from the beacon's light area ──────────
                 crop = rgb[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
                 beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
+                blink_info = _get_blink_detector(d.tracking_id).update(
+                    time.time(), beacon_color, intensity
+                )
                 # ─────────────────────────────────────────────────────────────
 
                 draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
@@ -933,6 +1072,10 @@ def main(model: str = "models/one_beacon.pt",
                     f"beacon [{beacon_color}] conf={d.confidence:.2f} int={intensity:.2f} "
                     f"r={votes['red']:.0%} g={votes['green']:.0%} b={votes['blue']:.0%}"
                 )
+                if blink_info["is_blinking"]:
+                    label_txt += f" blink={blink_info['blink_hz']:.2f}Hz"
+                elif blink_info["is_blinking"] is None:
+                    label_txt += " blink=?"
                 if d.tracking_id >= 0:
                     label_txt += f" #{d.tracking_id}"
 
@@ -959,8 +1102,9 @@ def main(model: str = "models/one_beacon.pt",
                 # ── Publish ──────────────────────────────────────────────────
                 msg = String()
                 msg.data = json.dumps({
-                    "label":            "beacon",
                     "color":            beacon_color,
+                    "blink":            blink_info,
+                    "label":            "beacon",
                     "color_confidence": color_conf,
                     "intensity":        intensity,
                     "hue_votes":        votes,
