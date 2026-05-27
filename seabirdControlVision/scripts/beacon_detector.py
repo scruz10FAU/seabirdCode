@@ -312,7 +312,9 @@ _BLINK_HZ_RANGE            = (0.5, 2.0)  # valid blink frequency range — cente
 _BLINK_MIN_EDGES           = 3     # rising edges needed (= 2 complete periods in the window)
 _BLINK_MIN_EDGE_GAP        = 0.20  # debounce: ignore edges closer than this (filters threshold chatter)
 _BLINK_MAX_OFF_SEC         = 1.0   # blue beacon: max consecutive off-state duration; longer = slow drift
-_BLINK_MAX_IOI_SEC         = 2.0   # max inter-onset interval (= max period for 0.5 Hz, the lowest valid freq)
+_BLINK_MAX_IOI_SEC         = 2.0   # blue beacon: max IOI (= max period for 0.5 Hz, the lowest valid freq)
+_BLINK_MAX_IOI_SEC_COLOR   = 2.5   # color beacons: extra 0.5 s slack absorbs YOLO detection gaps that can
+                                   # make one IOI appear as ~2 periods (e.g. gap swallows one green cycle)
 _BLINK_MIN_ON_OFF_GAP      = 0.40  # blue beacon: on/off mean separation must be ≥ 40% of total swing
 
 
@@ -623,8 +625,10 @@ class BlinkDetector:
             return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
         # A single IOI longer than the maximum valid period means two edges span a
         # skipped cycle — the mean would pass the Hz check but the pattern is not a
-        # stable blink.
-        if max(iois) > _BLINK_MAX_IOI_SEC:
+        # stable blink.  Color beacons get extra slack because a YOLO detection gap
+        # can swallow one full green/red cycle, making one IOI appear as ~2 periods.
+        max_ioi_limit = _BLINK_MAX_IOI_SEC if blink_color == "blue" else _BLINK_MAX_IOI_SEC_COLOR
+        if max(iois) > max_ioi_limit:
             return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
 
         hz = 1.0 / mean_ioi
