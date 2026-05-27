@@ -672,7 +672,8 @@ _COLOR_BGR = {
 
 def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
                     log_writer=None, frame_idx: int = 0,
-                    blink_detector: BlinkDetector = None) -> np.ndarray:
+                    blink_detector: BlinkDetector = None,
+                    video_ts: float = None) -> np.ndarray:
     """Draw detections + color classification on a single BGR frame."""
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -686,7 +687,8 @@ def _annotate_frame(frame: np.ndarray, boxes, names: dict, crop_model,
 
         blink_info = None
         if blink_detector is not None:
-            blink_info = blink_detector.update(time.time(), beacon_color, intensity)
+            ts = video_ts if video_ts is not None else time.time()
+            blink_info = blink_detector.update(ts, beacon_color, intensity)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
 
@@ -791,6 +793,7 @@ def run_video(video_path: str,
                 frame_idx += 1
 
                 display_frame = raw.copy()           # safe copy — YOLO never touches this
+                video_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                 results = model(raw, conf=conf, verbose=False)
                 boxes   = results[0].boxes
                 names   = results[0].names
@@ -798,7 +801,8 @@ def run_video(video_path: str,
                 print(f"Frame {frame_idx}/{total} — {len(boxes)} detection(s)")
                 display_frame = _annotate_frame(display_frame, boxes, names, crop_model,
                                                 log_writer=log_writer, frame_idx=frame_idx,
-                                                blink_detector=blink_detector)
+                                                blink_detector=blink_detector,
+                                                video_ts=video_ts)
 
                 if writer:
                     writer.write(display_frame)
@@ -923,6 +927,7 @@ def run_video_ros(video_path: str,
 
                 drone_pos, _ = cam.get_drone_pose()
                 display_frame = raw.copy()           # safe copy — YOLO never touches this
+                video_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
                 results = model(raw, conf=conf, verbose=False)
                 boxes   = results[0].boxes
@@ -937,7 +942,7 @@ def run_video_ros(video_path: str,
                     beacon_color, color_conf, light_mask, intensity, votes = isolate_and_classify(crop, crop_model)
                     draw_color = _COLOR_BGR.get(beacon_color, (180, 180, 180))
 
-                    blink_info = blink_detector.update(time.time(), beacon_color, intensity)
+                    blink_info = blink_detector.update(video_ts, beacon_color, intensity)
 
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), draw_color, 2)
 
