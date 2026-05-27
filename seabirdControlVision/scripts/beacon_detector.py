@@ -311,6 +311,9 @@ _BLINK_INTENSITY_MIN_SWING = 0.05  # blue beacon: min peak-to-peak intensity swi
 _BLINK_HZ_RANGE            = (0.5, 2.0)  # valid blink frequency range — centered on 1 Hz target
 _BLINK_MIN_EDGES           = 3     # rising edges needed (= 2 complete periods in the window)
 _BLINK_MIN_EDGE_GAP        = 0.20  # debounce: ignore edges closer than this (filters threshold chatter)
+_BLINK_MAX_OFF_SEC         = 1.0   # blue beacon: max consecutive off-state duration; longer = slow drift
+_BLINK_MAX_IOI_SEC         = 2.0   # max inter-onset interval (= max period for 0.5 Hz, the lowest valid freq)
+_BLINK_MIN_ON_OFF_GAP      = 0.40  # blue beacon: on/off mean separation must be ≥ 40% of total swing
 
 
 def _hue_votes(hues: np.ndarray) -> dict:
@@ -543,6 +546,34 @@ class BlinkDetector:
             mean_intensity = sum(intensities) / len(intensities)
             on_flags = [i >= mean_intensity for i in intensities]
 
+            # Reject slow intensity drifts that stay below the mean for longer than
+            # the maximum half-period of a valid blink (1 s at the 0.5 Hz floor).
+            # Camera-motion noise produces sustained "off" runs of 1-2 s; true 1 Hz
+            # blinks produce off runs of ~0.5 s.
+            _off_dur, _off_t0 = 0.0, None
+            for _t, _f in zip(timestamps, on_flags):
+                if not _f:
+                    if _off_t0 is None:
+                        _off_t0 = _t
+                    _off_dur = max(_off_dur, _t - _off_t0)
+                else:
+                    _off_t0 = None
+            if _off_dur > _BLINK_MAX_OFF_SEC:
+                return {"is_blinking": False, "blink_color": "blue", "blink_hz": None,
+                        "phase": "on" if on_flags[-1] else "off"}
+
+            # The mean "on" intensity and mean "off" intensity must be well-separated.
+            # If the split at the dynamic mean divides near-constant noise, the on/off
+            # means are almost identical — not a real blink signal.
+            _n_on  = sum(1 for f in on_flags if f)
+            _n_off = sum(1 for f in on_flags if not f)
+            if _n_on and _n_off:
+                _on_mean  = sum(intensities[j] for j, f in enumerate(on_flags) if     f) / _n_on
+                _off_mean = sum(intensities[j] for j, f in enumerate(on_flags) if not f) / _n_off
+                if (_on_mean - _off_mean) < _BLINK_MIN_ON_OFF_GAP * swing:
+                    return {"is_blinking": False, "blink_color": "blue", "blink_hz": None,
+                            "phase": "on" if on_flags[-1] else "off"}
+
         phase = "on" if on_flags[-1] else "off"
 
         # Rising edges (off→on), debounced to suppress threshold chatter.
@@ -576,6 +607,11 @@ class BlinkDetector:
         iois = [rising_edges[i + 1] - rising_edges[i] for i in range(len(rising_edges) - 1)]
         mean_ioi = sum(iois) / len(iois)
         if mean_ioi <= 0:
+            return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
+        # A single IOI longer than the maximum valid period means two edges span a
+        # skipped cycle — the mean would pass the Hz check but the pattern is not a
+        # stable blink.
+        if max(iois) > _BLINK_MAX_IOI_SEC:
             return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
 
         hz = 1.0 / mean_ioi
