@@ -591,11 +591,13 @@ class BlinkDetector:
                 rising_edges.append(t)
                 last_edge = t
 
-        # Need 3 rising edges = 2 complete periods in the window.
-        # If we don't have them yet, return null (still accumulating) unless the
-        # window is old enough that a 1 Hz beacon would definitely have produced them
-        # by now (3 s gives a 1 Hz beacon ~1 s of margin beyond the 2-edge minimum).
-        if len(rising_edges) < _BLINK_MIN_EDGES:
+        # Blue beacons use intensity oscillations which are prone to noise — require
+        # 3 edges (2 complete periods) for confidence.  Color-transition beacons
+        # (red/green) produce rising edges only on genuine color changes, so 2 edges
+        # (1 complete period, 1 IOI) is sufficient and avoids false negatives caused
+        # by YOLO occasionally missing frames at a transition point.
+        min_edges = _BLINK_MIN_EDGES if blink_color == "blue" else 2
+        if len(rising_edges) < min_edges:
             still_accumulating = data_span < (_BLINK_MIN_DATA_SEC + 1.0)
             return {
                 "is_blinking": None if still_accumulating else False,
@@ -603,6 +605,17 @@ class BlinkDetector:
                 "blink_hz": None,
                 "phase": phase if not still_accumulating else "unknown",
             }
+
+        # Duty-cycle guard for the 2-edge case on non-blue beacons.
+        # A solid beacon with occasional color-classification noise can produce exactly
+        # 2 rising edges while its on-fraction stays high (≥ 65%) because it's nearly
+        # always the signal color.  A genuinely blinking beacon has an on-fraction near
+        # 50%.  Skip this check when ≥ 3 edges are present — the IOI consistency test
+        # below is a stronger filter at that point.
+        if blink_color != "blue" and len(rising_edges) == 2:
+            on_fraction = sum(1 for f in on_flags if f) / len(on_flags)
+            if on_fraction > 0.65:
+                return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
 
         iois = [rising_edges[i + 1] - rising_edges[i] for i in range(len(rising_edges) - 1)]
         mean_ioi = sum(iois) / len(iois)
@@ -817,10 +830,10 @@ def run_video_ros(video_path: str,
                   crop_model_path: str = "models/best_crop.pt",
                   save_output: bool = False,
                   conf: float = 0.5,
-                  log: bool = False) -> None:
+                  log: bool = False,
+                  display: bool = False) -> None:
     """
-    Read frames from a local video file, publish detections to ROS, and show
-    a live display window.
+    Read frames from a local video file and publish detections to ROS.
 
     Initializes a ROS2 node for:
       - Publishing to /seabird/beacon_detections
@@ -828,7 +841,8 @@ def run_video_ros(video_path: str,
       - Receiving GPS origin from /mavros/global_position/gp_origin
 
     Frames come from cv2.VideoCapture — no camera topic subscriptions needed.
-    Press 'q' to quit, SPACE to pause/resume.
+    Pass display=True to open a live OpenCV window.
+    When display is on: press 'q' to quit, SPACE to pause/resume.
     """
     _import_ros()
 
@@ -858,7 +872,8 @@ def run_video_ros(video_path: str,
     print(f"[beacon-ros-video] {video_path}  {width}x{height} @ {fps:.1f}fps  {total} frames")
     print(f"[beacon-ros-video] Model: {model_path}  conf≥{conf}")
     print("[beacon-ros-video] Publishing → /seabird/beacon_detections")
-    print("[beacon-ros-video] Press 'q' to quit, SPACE to pause")
+    if display:
+        print("[beacon-ros-video] Press 'q' to quit, SPACE to pause")
 
     writer = None
     if save_output:
@@ -891,7 +906,8 @@ def run_video_ros(video_path: str,
     paused        = False
     display_frame = None
 
-    cv2.namedWindow("Beacon Detector — Video + ROS", cv2.WINDOW_AUTOSIZE)
+    if display:
+        cv2.namedWindow("Beacon Detector — Video + ROS", cv2.WINDOW_AUTOSIZE)
 
     try:
         while rclpy.ok():
@@ -975,13 +991,14 @@ def run_video_ros(video_path: str,
                 if writer:
                     writer.write(display_frame)
 
-            if display_frame is not None:
-                cv2.imshow("Beacon Detector — Video + ROS", display_frame)
-            key = cv2.waitKey(10 if not paused else 50) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord(" "):
-                paused = not paused
+            if display:
+                if display_frame is not None:
+                    cv2.imshow("Beacon Detector — Video + ROS", display_frame)
+                key = cv2.waitKey(10 if not paused else 50) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord(" "):
+                    paused = not paused
 
     except KeyboardInterrupt:
         print("\n[beacon-ros-video] Interrupted")
@@ -992,7 +1009,8 @@ def run_video_ros(video_path: str,
         if log_fh:
             log_fh.close()
         cam.close()
-        cv2.destroyAllWindows()
+        if display:
+            cv2.destroyAllWindows()
         rclpy.shutdown()
         print(f"[beacon-ros-video] Done — {frame_idx} frames processed")
 
@@ -1246,7 +1264,8 @@ if __name__ == "__main__":
 
     if args.ros_video is not None:
         run_video_ros(args.ros_video, model_path=args.model, crop_model_path=args.crop_model,
-                      save_output=args.save, conf=args.conf, log=args.log)
+                      save_output=args.save, conf=args.conf, log=args.log,
+                      display=args.display)
     elif args.video is not None:
         run_video(args.video, model_path=args.model, crop_model_path=args.crop_model,
                   save_output=args.save, conf=args.conf, log=args.log)
