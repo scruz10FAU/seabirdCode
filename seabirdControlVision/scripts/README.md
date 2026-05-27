@@ -194,7 +194,7 @@ The detected color and a `color_confidence` (fraction of crop pixels that are li
 | Mode | Flag | ROS node | Frame source | Live display | Publishes |
 |------|------|----------|--------------|--------------|-----------|
 | **ROS** | _(none)_ | Yes — full | ZED camera topics | `-d` flag | `/seabird/beacon_detections` |
-| **Video + ROS** | `--ros-video` | Yes — partial | Local video file | Always on | `/seabird/beacon_detections` |
+| **Video + ROS** | `--ros-video` | Yes — partial | Local video file | `-d` flag | `/seabird/beacon_detections` |
 | **Video only** | `--video` | No | Local video file | Always on | Nothing |
 
 **ROS mode** subscribes to ZED camera topics and drone pose, same as `sim_camera_zed.py`. Use `-d` to open a display window.
@@ -223,7 +223,7 @@ python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
 |------|-------|------|---------|------|-------------|
 | `--model` | `-m` | `str` | `models/one_beacon.pt` | All | Path to the Stage 1 YOLO beacon localization model |
 | `--crop-model` | `-cm` | `str` | `models/best_crop.pt` | All | Path to the Stage 2 YOLO lit-area isolation model |
-| `--display` | `-d` | flag | `False` | ROS only | Show a live OpenCV window |
+| `--display` | `-d` | flag | `False` | ROS, Video + ROS | Show a live OpenCV window |
 | `--true_dist` | `-td` | `float` | `0.4826` | ROS only | Known ground-truth distance to target (meters) for depth error reporting |
 | `--ros-video` | `-rv` | `str` | `None` | — | Path to video file — read frames from file, publish via ROS, show display |
 | `--video` | `-v` | `str` | `None` | — | Path to video file — pure CV test, no ROS |
@@ -237,7 +237,7 @@ python3 beacon_detector.py --video path/to/footage.mp4 [OPTIONS]
 
 `--crop-model` / `-cm` — path to the Stage 2 `.pt` model that isolates the lit/glowing area within a beacon crop. Accepts both detection and segmentation model types. Defaults to `models/best_crop.pt`. If the file is missing at startup, the script exits with an error message.
 
-`--ros-video` / `-rv` — initializes a ROS2 node with only the detection publisher and pose/GPS subscribers (no image topic subscriptions). Frames come from `cv2.VideoCapture`. `drone_position` in published messages is populated if MAVROS is running; `position_3d` and `world_position` are `null` since there is no depth map from a video file. Output saved as `<input>_beacon_ros_out.mp4` when `--save` is used.
+`--ros-video` / `-rv` — initializes a ROS2 node with only the detection publisher and pose/GPS subscribers (no image topic subscriptions). Frames come from `cv2.VideoCapture`. No display window is opened by default; add `-d` to show one. `drone_position` in published messages is populated if MAVROS is running; `position_3d` and `world_position` are `null` since there is no depth map from a video file. Output saved as `<input>_beacon_ros_out.mp4` when `--save` is used.
 
 `--video` / `-v` — pure offline test mode. No ROS node is created. Press **SPACE** to pause/resume; press **q** to quit. Output saved as `<input>_beacon_out.mp4` when `--save` is used.
 
@@ -256,10 +256,13 @@ python3 beacon_detector.py -d
 # ROS mode — custom crop model
 python3 beacon_detector.py -cm models/best_crop_v2.pt -d
 
-# Video + ROS — play back footage through the full ROS pipeline
+# Video + ROS — headless (default), publish detections to ROS
 python3 beacon_detector.py -rv footage.mp4
 
-# Video + ROS — save annotated output, custom crop model
+# Video + ROS — with live display window
+python3 beacon_detector.py -rv footage.mp4 -d
+
+# Video + ROS — save annotated output, custom crop model, no display
 python3 beacon_detector.py -rv footage.mp4 -cm models/best_crop.pt -s
 
 # Video only — quick offline test, lower confidence threshold
@@ -278,8 +281,14 @@ The `r/g/b` percentages are the live hue vote fractions for that detection. `"ot
 **Published message fields (ROS and Video + ROS modes):**
 ```json
 {
-  "label":            "beacon",
   "color":            "blue",
+  "blink": {
+    "is_blinking":  true,
+    "blink_color":  "blue",
+    "blink_hz":     1.03,
+    "phase":        "on"
+  },
+  "label":            "beacon",
   "color_confidence": 0.42,
   "intensity":        0.71,
   "hue_votes":        {"red": 0.04, "green": 0.05, "blue": 0.76, "other": 0.15},
@@ -293,11 +302,27 @@ The `r/g/b` percentages are the live hue vote fractions for that detection. `"ot
   "timestamp":        1716300000.0
 }
 ```
-`position_3d`, `world_position`, and `gps_position` are `null` in Video + ROS mode (no depth map available from a video file).
 
-`intensity` is the mean HSV Value of the lit pixels, normalized 0.0–1.0. For a `"blue"` result, values below ~0.4 suggest the beacon may be off or too dim to classify reliably in daylight.
+**Field notes:**
 
-`hue_votes` fractions sum to 1.0. `"other"` is the fraction of lit pixels whose hue falls in a gap between the defined bands.
+`color` — detected beacon color: `"red"`, `"green"`, `"blue"`, `"white"`, or `"unknown"`.
+
+`blink` — blink detection result from the rolling 4-second window:
+
+| Sub-field | Type | Description |
+|-----------|------|-------------|
+| `is_blinking` | `true` / `false` / `null` | `null` means insufficient data to decide (first ~3 s) |
+| `blink_color` | string | Color of the blinking signal (`"unknown"` while `is_blinking` is `null`) |
+| `blink_hz` | number / `null` | Estimated frequency in Hz when blinking; `null` otherwise |
+| `phase` | `"on"` / `"off"` / `"unknown"` | Whether the beacon appears on or off at this frame |
+
+`color_confidence` — fraction of pixels in the beacon crop that are classified as lit (0.0–1.0).
+
+`intensity` — mean HSV brightness of the lit pixels (0.0–1.0). For a `"blue"` result, values below ~0.4 suggest the beacon may be off or too dim to classify reliably in daylight.
+
+`hue_votes` — per-pixel hue vote fractions; values sum to 1.0. `"other"` is the fraction of lit pixels whose hue falls in a gap between the defined color bands.
+
+`position_3d`, `world_position`, and `gps_position` are `null` in Video + ROS mode (no depth map available from a video file). `tracking_id` is `-1` in Video + ROS mode (no tracker running).
 
 **Tuning notes:**
 - `_SAT_MIN` and `_VAL_MIN` at the top of the file control which pixels count as "lit". Increase `_VAL_MIN` if background objects are picked up; decrease it if a dim beacon is being missed.
@@ -305,6 +330,92 @@ The `r/g/b` percentages are the live hue vote fractions for that detection. `"ot
 - The Stage 2 confidence threshold is hardcoded at `0.3` in `isolate_and_classify()` — lower than the main detection threshold to prefer finding something rather than falling back to full-crop analysis.
 - A color must win ≥ 30% of lit-pixel votes to be declared the result. Below that threshold the result is `"unknown"`.
 - To flag a potentially-off blue beacon in consuming code: `color == "blue" and intensity < 0.4`.
+
+---
+
+### `batch_detect.py`
+**Headless batch processor for multiple videos.** Runs the full beacon detection pipeline on a list of video files without opening any display windows, writes every per-frame detection to a single combined CSV, and prints a human-readable summary of what was found in each video.
+
+Loads the YOLO models once and reuses them across all videos — faster than invoking `beacon_detector.py` separately for each file. Each video gets its own `BlinkDetector` instance, so blink state does not carry over between files.
+
+**Usage:**
+```bash
+# No ROS required
+python3 batch_detect.py video1.mp4 video2.mp4 video3.mp4 video4.mp4 video5.mp4 video6.mp4
+
+# Custom models and confidence threshold
+python3 batch_detect.py -m models/one_beacon.pt -cm models/best_crop.pt -c 0.4 videos/*.mp4
+
+# Write output files to a specific directory
+python3 batch_detect.py -o /path/to/logs video1.mp4 video2.mp4
+```
+
+**Arguments:**
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `videos` | — | positional | — | One or more video files to process |
+| `--model` | `-m` | `str` | `models/one_beacon.pt` | Path to Stage 1 YOLO beacon localization model |
+| `--crop-model` | `-cm` | `str` | `models/best_crop.pt` | Path to Stage 2 YOLO lit-area isolation model |
+| `--conf` | `-c` | `float` | `0.5` | YOLO detection confidence threshold |
+| `--output-dir` | `-o` | `str` | Directory of first video | Where to write the output CSV and summary |
+
+**Output files** (both named with the run timestamp):
+
+`batch_detections_<timestamp>.csv` — one row per detection per frame across all videos. Columns:
+
+| Column | Description |
+|--------|-------------|
+| `video` | Filename of the source video |
+| `timestamp` | Wall-clock time of the frame (seconds) |
+| `frame` | Frame index within that video |
+| `color` | Detected beacon color (`red`, `green`, `blue`, `white`, `unknown`) |
+| `color_confidence` | Fraction of lit pixels in the beacon crop |
+| `intensity` | Mean HSV brightness of lit pixels (0.0–1.0) |
+| `is_blinking` | `True`, `False`, or blank (unknown — insufficient data) |
+| `blink_hz` | Estimated blink frequency in Hz when blinking, blank otherwise |
+| `blink_phase` | `on`, `off`, or `unknown` at this frame |
+| `vote_red/green/blue/other` | Per-pixel hue vote fractions |
+| `det_confidence` | YOLO Stage 1 detection confidence |
+| `x1, y1, x2, y2` | Beacon bounding box in pixel coordinates |
+
+`batch_summary_<timestamp>.txt` — printed to the terminal and saved to disk. For each video it shows:
+- Total frames processed and detection rate
+- Color breakdown: frame counts and percentage for each detected color
+- Blink status: frames classified as blinking / not blinking / unknown, and average Hz when blinking
+- Overall totals across all videos at the end
+
+**Example summary output:**
+```
+============================================================
+BATCH DETECTION SUMMARY
+Run at : 2026-05-27 14:03:21
+Videos : 6
+Log    : /path/to/batch_detections_20260527_140321.csv
+============================================================
+
+Video : solid_blue.mp4
+  Frames processed  : 750
+  Frames with beacon: 720 (96.0%)
+  Color breakdown:
+    blue        720 frames  (100.0%)
+  Blink status (of detected frames):
+    Blinking    :     0 (0.0%)
+    Not blinking:   668 (92.8%)
+    Unknown     :    52 (7.2%)
+
+Video : blinking_blue.mp4
+  Frames processed  : 705
+  Frames with beacon: 680 (96.5%)
+  Color breakdown:
+    blue        680 frames  (100.0%)
+  Blink status (of detected frames):
+    Blinking    :   433 (63.7%)
+    Not blinking:    88 (12.9%)
+    Unknown     :   159 (23.4%)
+    Avg blink frequency: 1.03 Hz
+...
+```
 
 ---
 
@@ -493,7 +604,7 @@ bash ~/seabird/scripts/kill_all.sh
 | Package | Used by |
 |---------|---------|
 | `rclpy`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `message_filters` | `sim_camera.py`, `sweep_and_detect.py`, `gt_label_viz.py` |
-| `ultralytics` (YOLOv8) | `yolo_detector.py` |
+| `ultralytics` (YOLOv8) | `yolo_detector.py`, `batch_detect.py` |
 | `mavsdk` | `sweep_and_detect.py`, `keyboard_controller.py`, `takeoff_test.py` |
 | `opencv-python` | `sim_camera.py`, `gt_label_viz.py`, `ground_truth_labeler.py` |
 | `scipy` | `seabird_config.py` (`camera_to_world`) |
