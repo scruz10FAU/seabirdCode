@@ -16,7 +16,7 @@ Stage 3 — Color classification:
   1. Convert the lit crop to HSV.
   2. Mask pixels with high Value (≥ 160) and moderate Saturation (≥ 60).
   3. Compute the circular mean hue (handles red wrap-around at 0°/180°).
-  4. Map the hue to: red, orange, yellow, green, cyan, blue, magenta, white, or unknown.
+  4. Map the hue to: red, green, blue, or unknown.
 
 Usage:
     python3 beacon_detector.py                          # ROS live mode
@@ -31,255 +31,24 @@ import argparse
 import os
 sys.path.insert(0, os.path.expanduser("~/seabird/scripts"))
 
-import threading
 import csv
 import numpy as np
 from typing import Tuple
 import json
 import time
 import cv2
-from collections import deque, Counter
 
-DEFAULT_TOPIC_PREFIX = "/zed/zed_node"
-DRONE_POSE_TOPIC     = "/mavros/local_position/pose"
-GPS_TOPIC            = "/mavros/global_position/gp_origin"
-EARTH_RADIUS_M       = 6378137.0
+from blink_detector import BlinkDetector, _get_blink_detector
+
+EARTH_RADIUS_M = 6378137.0
 
 # Lazily imported only when ROS mode is used
 def _import_ros():
-    global rclpy, Node, QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    global Image, CameraInfo, PoseStamped, GeoPointStamped, String, message_filters
-    global CameraInterface, CameraConfig, Detection, Intrinsics
-    global IMG_W, IMG_H, FX, FY, CX, CY, camera_to_world, YoloDetector
-    global BeaconCamera
+    global rclpy, String, camera_to_world, BeaconCamera
     import rclpy as _rclpy; rclpy = _rclpy
-    from rclpy.node import Node as _Node; Node = _Node
-    from rclpy.qos import (QoSProfile as _QP, ReliabilityPolicy as _RP,
-                            HistoryPolicy as _HP, DurabilityPolicy as _DP)
-    QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy = _QP, _RP, _HP, _DP
-    from sensor_msgs.msg import Image as _Im, CameraInfo as _CI
-    Image, CameraInfo = _Im, _CI
-    from geometry_msgs.msg import PoseStamped as _PS; PoseStamped = _PS
-    from geographic_msgs.msg import GeoPointStamped as _GPS; GeoPointStamped = _GPS
     from std_msgs.msg import String as _Str; String = _Str
-    import message_filters as _mf; message_filters = _mf
-    from camera_interface import CameraInterface as _CAM, CameraConfig as _CC, Detection as _D, Intrinsics as _I
-    CameraInterface, CameraConfig, Detection, Intrinsics = _CAM, _CC, _D, _I
-    from seabird_config import IMG_W as _W, IMG_H as _H, FX as _FX, FY as _FY, CX as _CX, CY as _CY, camera_to_world as _c2w
-    IMG_W, IMG_H, FX, FY, CX, CY, camera_to_world = _W, _H, _FX, _FY, _CX, _CY, _c2w
-    from yolo_detector import YoloDetector as _YD; YoloDetector = _YD
-
-    class BeaconCamera(Node):
-        """
-        Subscribes to ZED camera topics and runs beacon detection + color classification.
-
-        Publishes:
-            /seabird/beacon_detections  — JSON with label "beacon", detected color, position
-        """
-
-        def __init__(self, topic_prefix=DEFAULT_TOPIC_PREFIX):
-            super().__init__("beacon_camera")
-            self._topic_prefix = topic_prefix
-
-            self._rgb        = None
-            self._depth      = None
-            self._intrinsics = None
-            self._new_frame  = False
-            self._frame_lock = threading.Lock()
-
-            self._drone_pos       = None
-            self._drone_quat_wxyz = None
-            self._pose_lock       = threading.Lock()
-
-            self._gps_origin      = None
-            self._gps_origin_lock = threading.Lock()
-
-            self._is_open   = False
-            self._detector  = None
-            self.detection_pub = None
-
-        # ── Lifecycle ──────────────────────────────────────────────────────────
-
-        def open(self):
-            if self._is_open:
-                return True
-
-            qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-            )
-
-            self._info_sub = self.create_subscription(
-                CameraInfo,
-                f"{self._topic_prefix}/rgb/color/rect/camera_info",
-                self._on_camera_info,
-                qos,
-            )
-
-            rgb_sub   = message_filters.Subscriber(
-                self, Image, f"{self._topic_prefix}/rgb/color/rect/image", qos_profile=qos
-            )
-            depth_sub = message_filters.Subscriber(
-                self, Image, f"{self._topic_prefix}/depth/depth_registered", qos_profile=qos
-            )
-            self._sync = message_filters.ApproximateTimeSynchronizer(
-                [rgb_sub, depth_sub], queue_size=5, slop=0.05
-            )
-            self._sync.registerCallback(self._on_synced_frame)
-
-            self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
-
-            self._pose_sub = self.create_subscription(
-                PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
-            )
-
-            origin_qos = QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                depth=1,
-            )
-            self._origin_sub = self.create_subscription(
-                GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
-            )
-
-            self._is_open = True
-            self.get_logger().info("BeaconCamera open — waiting for frames…")
-            return True
-
-        def open_for_video(self):
-            """
-            Minimal ROS setup for video-file input mode.
-            Creates the detection publisher and subscribes to drone pose + GPS,
-            but skips all camera image subscriptions (frames come from cv2.VideoCapture).
-            """
-            if self._is_open:
-                return True
-
-            qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-            )
-
-            self.detection_pub = self.create_publisher(String, "/seabird/beacon_detections", 10)
-
-            self._pose_sub = self.create_subscription(
-                PoseStamped, DRONE_POSE_TOPIC, self._on_drone_pose, qos
-            )
-
-            origin_qos = QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                depth=1,
-            )
-            self._origin_sub = self.create_subscription(
-                GeoPointStamped, GPS_TOPIC, self._on_gps_origin, origin_qos
-            )
-
-            self._is_open = True
-            self.get_logger().info("BeaconCamera open (video-file mode) — pose + GPS only")
-            return True
-
-        def close(self):
-            self._is_open = False
-
-        def grab(self):
-            if not self._is_open:
-                return False
-            rclpy.spin_once(self, timeout_sec=0.05)
-            with self._frame_lock:
-                if self._new_frame:
-                    self._new_frame = False
-                    return True
-            return False
-
-        def enable_detection(self, model_path):
-            self._detector = YoloDetector(
-                weights=model_path,
-                class_names=["beacon"],
-                imgsz=320,
-                conf_thresh=0.5,
-            )
-            ok = self._detector.start(enable_tracking=True)
-            if not ok:
-                self._detector = None
-                self.get_logger().error("YoloDetector failed to start")
-            return ok
-
-        def get_rgb(self):
-            with self._frame_lock:
-                return self._rgb.copy() if self._rgb is not None else None
-
-        def get_depth(self):
-            with self._frame_lock:
-                return self._depth.copy() if self._depth is not None else None
-
-        def get_drone_pose(self):
-            with self._pose_lock:
-                if self._drone_pos is None:
-                    return None, None
-                return self._drone_pos.copy(), self._drone_quat_wxyz.copy()
-
-        def get_gps_origin(self):
-            with self._gps_origin_lock:
-                return self._gps_origin
-
-        def get_detections(self):
-            if self._detector is None:
-                return []
-            with self._frame_lock:
-                rgb   = self._rgb.copy()   if self._rgb   is not None else None
-                depth = self._depth.copy() if self._depth is not None else None
-            if rgb is None:
-                return []
-            return self._detector.detect(rgb, depth, self._intrinsics)
-
-        # ── ROS2 Callbacks ──────────────────────────────────────────────────────
-
-        def _on_camera_info(self, _msg):
-            if self._intrinsics is not None:
-                return
-            self._intrinsics = Intrinsics(
-                fx=FX, fy=FY, cx=CX, cy=CY, width=IMG_W, height=IMG_H
-            )
-            self.get_logger().info(
-                f"Intrinsics set from config: fx={FX:.1f} fy={FY:.1f} "
-                f"cx={CX:.1f} cy={CY:.1f} {IMG_W}x{IMG_H}"
-            )
-            self.destroy_subscription(self._info_sub)
-
-        def _on_synced_frame(self, rgb_msg, depth_msg):
-            channels = len(rgb_msg.data) // (rgb_msg.height * rgb_msg.width)
-            rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(
-                rgb_msg.height, rgb_msg.width, channels
-            )
-            bgr   = rgb[:, :, :3][:, :, ::-1].copy()
-            depth = np.frombuffer(depth_msg.data, dtype=np.float32).reshape(
-                depth_msg.height, depth_msg.width
-            ).copy()
-            with self._frame_lock:
-                self._rgb       = bgr
-                self._depth     = depth
-                self._new_frame = True
-
-        def _on_drone_pose(self, msg):
-            p, q = msg.pose.position, msg.pose.orientation
-            with self._pose_lock:
-                self._drone_pos       = np.array([p.x, p.y, p.z])
-                self._drone_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
-
-        def _on_gps_origin(self, msg):
-            with self._gps_origin_lock:
-                self._gps_origin = (
-                    msg.position.latitude,
-                    msg.position.longitude,
-                    msg.position.altitude,
-                )
-            self.get_logger().info(
-                f"GPS origin: lat={msg.position.latitude:.7f} "
-                f"lon={msg.position.longitude:.7f}"
-            )
+    from seabird_config import camera_to_world as _c2w; camera_to_world = _c2w
+    from beacon_camera import BeaconCamera as _BC; BeaconCamera = _BC
 
 # ── Color classification ───────────────────────────────────────────────────────
 
@@ -304,18 +73,6 @@ _HUE_BANDS = [
 # Setting this to 0.25 catches dim/transitioning red LEDs without false-triggering on
 # the off state.
 _RED_THRESHOLD = 0.1
-
-_BLINK_WINDOW_SEC          = 4.0   # rolling window length for blink estimation (seconds)
-_BLINK_MIN_DATA_SEC        = 2.0   # return "unknown" until this many seconds of samples are in the window
-_BLINK_INTENSITY_MIN_SWING = 0.05  # blue beacon: min peak-to-peak intensity swing to qualify as blinking
-_BLINK_HZ_RANGE            = (0.5, 2.0)  # valid blink frequency range — centered on 1 Hz target
-_BLINK_MIN_EDGES           = 3     # rising edges needed (= 2 complete periods in the window)
-_BLINK_MIN_EDGE_GAP        = 0.20  # debounce: ignore edges closer than this (filters threshold chatter)
-_BLINK_MAX_OFF_SEC         = 1.0   # blue beacon: max consecutive off-state duration; longer = slow drift
-_BLINK_MAX_IOI_SEC         = 2.0   # blue beacon: max IOI (= max period for 0.5 Hz, the lowest valid freq)
-_BLINK_MAX_IOI_SEC_COLOR   = 2.5   # color beacons: extra 0.5 s slack absorbs YOLO detection gaps that can
-                                   # make one IOI appear as ~2 periods (e.g. gap swallows one green cycle)
-_BLINK_MIN_ON_OFF_GAP      = 0.40  # blue beacon: on/off mean separation must be ≥ 40% of total swing
 
 
 def _hue_votes(hues: np.ndarray) -> dict:
@@ -493,162 +250,6 @@ def _write_log_row(log_writer, frame_idx: int, color: str,
         f"{det_conf:.4f}", x1, y1, x2, y2, tracking_id,
         px, py, pz,
     ])
-
-
-# ── Blink detection ───────────────────────────────────────────────────────────
-
-class BlinkDetector:
-    """
-    Estimates blink frequency from a rolling window of (timestamp, color, intensity) samples.
-
-    Red/green beacons: rising edge = transition from "blue" (off) to signal color (on).
-    Blue beacon:       rising edge = intensity crossing _BLUE_ON_INTENSITY upward.
-    Returns a dict: {is_blinking, blink_color, blink_hz, phase}.
-    """
-
-    def __init__(self):
-        self._samples: deque = deque()  # (timestamp, color, intensity)
-
-    def update(self, ts: float, color: str, intensity: float) -> dict:
-        self._samples.append((ts, color, intensity))
-        cutoff = ts - _BLINK_WINDOW_SEC
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
-        return self._estimate()
-
-    def _estimate(self) -> dict:
-        if len(self._samples) < 4:
-            return {"is_blinking": None, "blink_color": "unknown", "blink_hz": None, "phase": "unknown"}
-
-        timestamps  = [s[0] for s in self._samples]
-        colors      = [s[1] for s in self._samples]
-        intensities = [s[2] for s in self._samples]
-
-        data_span = timestamps[-1] - timestamps[0]
-
-        # Not enough history yet — is_blinking=None signals "still deciding",
-        # distinct from False which means "confirmed not blinking".
-        if data_span < _BLINK_MIN_DATA_SEC:
-            return {"is_blinking": None, "blink_color": "unknown", "blink_hz": None, "phase": "unknown"}
-
-        # Determine signal type from dominant non-blue color in window
-        color_counts = Counter(c for c in colors if c not in ("blue", "unknown"))
-        if color_counts:
-            blink_color = color_counts.most_common(1)[0][0]
-            on_flags = [c == blink_color for c in colors]
-        else:
-            # All blue — detect oscillations relative to the window mean.
-            # Requires a minimum peak-to-peak swing so flat/steady signals don't
-            # generate spurious rising edges.
-            blink_color = "blue"
-            swing = max(intensities) - min(intensities)
-            if swing < _BLINK_INTENSITY_MIN_SWING:
-                phase = "on" if intensities[-1] >= (sum(intensities) / len(intensities)) else "off"
-                return {"is_blinking": False, "blink_color": "blue", "blink_hz": None, "phase": phase}
-            mean_intensity = sum(intensities) / len(intensities)
-            on_flags = [i >= mean_intensity for i in intensities]
-
-            # Reject slow intensity drifts that stay below the mean for longer than
-            # the maximum half-period of a valid blink (1 s at the 0.5 Hz floor).
-            # Camera-motion noise produces sustained "off" runs of 1-2 s; true 1 Hz
-            # blinks produce off runs of ~0.5 s.
-            _off_dur, _off_t0 = 0.0, None
-            for _t, _f in zip(timestamps, on_flags):
-                if not _f:
-                    if _off_t0 is None:
-                        _off_t0 = _t
-                    _off_dur = max(_off_dur, _t - _off_t0)
-                else:
-                    _off_t0 = None
-            if _off_dur > _BLINK_MAX_OFF_SEC:
-                return {"is_blinking": False, "blink_color": "blue", "blink_hz": None,
-                        "phase": "on" if on_flags[-1] else "off"}
-
-            # The mean "on" intensity and mean "off" intensity must be well-separated.
-            # If the split at the dynamic mean divides near-constant noise, the on/off
-            # means are almost identical — not a real blink signal.
-            _n_on  = sum(1 for f in on_flags if f)
-            _n_off = sum(1 for f in on_flags if not f)
-            if _n_on and _n_off:
-                _on_mean  = sum(intensities[j] for j, f in enumerate(on_flags) if     f) / _n_on
-                _off_mean = sum(intensities[j] for j, f in enumerate(on_flags) if not f) / _n_off
-                if (_on_mean - _off_mean) < _BLINK_MIN_ON_OFF_GAP * swing:
-                    return {"is_blinking": False, "blink_color": "blue", "blink_hz": None,
-                            "phase": "on" if on_flags[-1] else "off"}
-
-        phase = "on" if on_flags[-1] else "off"
-
-        # Rising edges (off→on), debounced to suppress threshold chatter.
-        # Frames near the mean crossing can flip rapidly, producing fake edges
-        # with sub-frame IOIs that would corrupt the frequency estimate.
-        raw_edges = [
-            timestamps[i]
-            for i in range(1, len(on_flags))
-            if not on_flags[i - 1] and on_flags[i]
-        ]
-        rising_edges: list = []
-        last_edge = -1.0
-        for t in raw_edges:
-            if t - last_edge >= _BLINK_MIN_EDGE_GAP:
-                rising_edges.append(t)
-                last_edge = t
-
-        # Blue beacons use intensity oscillations which are prone to noise — require
-        # 3 edges (2 complete periods) for confidence.  Color-transition beacons
-        # (red/green) produce rising edges only on genuine color changes, so 2 edges
-        # (1 complete period, 1 IOI) is sufficient and avoids false negatives caused
-        # by YOLO occasionally missing frames at a transition point.
-        min_edges = _BLINK_MIN_EDGES if blink_color == "blue" else 2
-        if len(rising_edges) < min_edges:
-            still_accumulating = data_span < (_BLINK_MIN_DATA_SEC + 1.0)
-            return {
-                "is_blinking": None if still_accumulating else False,
-                "blink_color": blink_color if not still_accumulating else "unknown",
-                "blink_hz": None,
-                "phase": phase if not still_accumulating else "unknown",
-            }
-
-        # Duty-cycle guard for the 2-edge case on non-blue beacons.
-        # A solid beacon with occasional color-classification noise can produce exactly
-        # 2 rising edges while its on-fraction stays high (≥ 65%) because it's nearly
-        # always the signal color.  A genuinely blinking beacon has an on-fraction near
-        # 50%.  Skip this check when ≥ 3 edges are present — the IOI consistency test
-        # below is a stronger filter at that point.
-        if blink_color != "blue" and len(rising_edges) == 2:
-            on_fraction = sum(1 for f in on_flags if f) / len(on_flags)
-            if on_fraction > 0.65:
-                return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
-
-        iois = [rising_edges[i + 1] - rising_edges[i] for i in range(len(rising_edges) - 1)]
-        mean_ioi = sum(iois) / len(iois)
-        if mean_ioi <= 0:
-            return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
-        # A single IOI longer than the maximum valid period means two edges span a
-        # skipped cycle — the mean would pass the Hz check but the pattern is not a
-        # stable blink.  Color beacons get extra slack because a YOLO detection gap
-        # can swallow one full green/red cycle, making one IOI appear as ~2 periods.
-        max_ioi_limit = _BLINK_MAX_IOI_SEC if blink_color == "blue" else _BLINK_MAX_IOI_SEC_COLOR
-        if max(iois) > max_ioi_limit:
-            return {"is_blinking": False, "blink_color": blink_color, "blink_hz": None, "phase": phase}
-
-        hz = 1.0 / mean_ioi
-        lo, hi = _BLINK_HZ_RANGE
-        is_blinking = lo <= hz <= hi
-        return {
-            "is_blinking": is_blinking,
-            "blink_color": blink_color,
-            "blink_hz":    round(hz, 2) if is_blinking else None,
-            "phase":       phase,
-        }
-
-
-_blink_detectors: dict = {}
-
-
-def _get_blink_detector(tracking_id: int) -> BlinkDetector:
-    if tracking_id not in _blink_detectors:
-        _blink_detectors[tracking_id] = BlinkDetector()
-    return _blink_detectors[tracking_id]
 
 
 # ── Helper (used by ROS modes) ────────────────────────────────────────────────
