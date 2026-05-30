@@ -318,9 +318,11 @@ export default function RobotXWebsite() {
             className="flex items-center gap-2 min-w-0"
             aria-label="Go to top"
           >
-            <div className="h-9 w-9 rounded-2xl bg-black/5 dark:bg-white/10 flex items-center justify-center">
-              <Ship className="h-5 w-5" />
-            </div>
+            <img
+              src="AllBlackTextOwlV1.png"
+              alt="SeaOwls Logo"
+              className="h-12 w-12 object-contain"
+            />
             <div className="min-w-0">
               <div className="font-semibold leading-none truncate">SeaOwls</div>
               <div className="text-xs text-muted-foreground leading-none mt-1 truncate">UAV • USV • UUV</div>
